@@ -1,0 +1,17 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          V="${GITHUB_REF_NAME#v}"
+          git archive --format=tar.gz --prefix="lgtv-daemon-$V/" -o "lgtv-daemon-$V.tar.gz" HEAD
+          gh release create "$GITHUB_REF_NAME" "lgtv-daemon-$V.tar.gz" --title "LGTV Daemon $V" --notes-file CHANGELOG.md
+        env:
+          GH_TOKEN: ${{ github.token }}

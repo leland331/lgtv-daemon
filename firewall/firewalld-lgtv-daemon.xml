@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>LGTV Daemon</short>
+  <description>SSDP discovery replies from LG WebOS TVs (to the fixed local reply port)</description>
+  <port protocol="udp" port="41900"/>
+</service>

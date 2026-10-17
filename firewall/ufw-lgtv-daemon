@@ -1,0 +1,4 @@
+[lgtv-daemon]
+title=LGTV Daemon
+description=SSDP discovery replies from LG WebOS TVs (to the fixed local reply port)
+ports=41900/udp

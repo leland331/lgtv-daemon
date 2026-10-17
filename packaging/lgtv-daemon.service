@@ -1,0 +1,12 @@
+[Unit]
+Description=LGTV Daemon (TV power, idle and topology management)
+PartOf=graphical-session.target
+After=graphical-session.target network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/lgtv-daemon --daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

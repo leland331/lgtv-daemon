@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=LGTV Daemon
+Comment=Control LG WebOS TVs used as PC monitors
+Exec=lgtv-daemon --gui
+Icon=io.github.lgtv_daemon
+Categories=Settings;HardwareSettings;
+StartupWMClass=io.github.lgtv_daemon
