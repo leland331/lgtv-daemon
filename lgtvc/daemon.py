@@ -7,11 +7,11 @@ import socket
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
 
 from gi.repository import GLib
 
-from . import commands, config, idle, topology, webos
+from . import commands, config, idle, persist, startup, topology, wake, webos
 from .keepawake import KeepAwake
 from .tray import Tray
 
@@ -28,7 +28,16 @@ class Daemon:
         self.input_watch = None       # manual blank/off: short idle watcher, wakes the TV on input
         self.session_on = set()       # -autoenable  (until restart)
         self.user_idle = False
+        self.network_woken = False    # woken by Wake-on-LAN: TV stays off until keyboard/mouse input
+        self.sleep_snapshot = None    # network-card wakeup counters taken before sleep
         self.streaming = False
+        self.persist = {}             # device name -> persist.Persistent
+        self.sleep_lock = threading.Lock()
+        self.sleep_off_at = 0.0       # when the TVs were last powered off for sleep/shutdown
+        self.user_off = set()         # TVs turned off at the TV/remote: stay off until fresh input
+        self.own_off_at = {}          # device name -> when the daemon itself last turned it off/blank
+        self.on_busy = set()          # devices with a power on queued or running (debounce)
+        self.resumed_at = 0.0
         self.topo = {}
         self.dpms = {}
         self.idle_backend = None
@@ -83,8 +92,17 @@ class Daemon:
         devices = self.managed() if devices is None else devices
         futs = []
         for d in devices:
+            if action in ("on", "unblank"):
+                if d["name"] in self.user_off:
+                    self.log("%s: stays off (turned off at the TV) until keyboard or mouse input" % d["name"])
+                    continue
+                if action == "on" and d["name"] in self.on_busy:
+                    continue                  # a power on is already queued or running
+            if action in ("off", "off_forced", "blank"):
+                self.own_off_at[d["name"]] = time.time()
             if action == "on":
-                f = (webos.power_on, d, self.cfg["power_on_timeout"], self.log)
+                self.on_busy.add(d["name"])
+                f = (self._power_on, d)
             elif action == "off":
                 f = (webos.power_off, d, self.cfg["blank_instead_of_poweroff"], self.log)
             elif action == "off_forced":   # user's own command: skip the HDMI input check
@@ -101,6 +119,109 @@ class Daemon:
         if wait:
             for f in futs:
                 f.result()
+
+    def _power_on(self, d):
+        try:
+            ok = webos.power_on(d, self.cfg["power_on_timeout"], self.log,
+                                cancel=lambda: d["name"] in self.user_off)
+        finally:
+            self.on_busy.discard(d["name"])
+        p = self.persist.get(d["name"])
+        if ok and p and not p.alive():
+            p.kick()
+        return ok
+
+    # ------------------------------------------------------------ persistent connections
+    def sync_persistent(self):
+        """Keep one persistent connection per managed, paired TV (config: persistent_connection)."""
+        want = {d["name"]: d for d in self.managed() if d["key"]} if self.cfg["persistent_connection"] else {}
+        for name in list(self.persist):
+            p = self.persist[name]
+            if name not in want or not p.same_device(want[name]):
+                p.stop()
+                del self.persist[name]
+        for name, d in want.items():
+            if name not in self.persist:
+                self.persist[name] = persist.Persistent(d, self.log, on_change=self.tv_state_changed).start()
+
+    # ------------------------------------------------------------ turned off at the TV
+    def is_external_off(self, name, old, new, now=None):
+        """True if a state change means someone turned the TV off at the TV or remote, not us."""
+        now = time.time() if now is None else now
+        if old not in ("Active", "Screen Off") or new not in ("Active Standby", "Suspend", "Power Off", ""):
+            return False
+        if new == "" and old != "Active":
+            return False                  # lost connection while blanked: not a clear signal
+        recent = max(self.own_off_at.get(name, 0), self.sleep_off_at, self.resumed_at)
+        return now - recent > 15
+
+    def tv_state_changed(self, name, old, new):
+        """From a persistent connection's thread."""
+        if self.is_external_off(name, old, new):
+            GLib.idle_add(self.mark_user_off, name)
+        elif new == "Active" and name in self.user_off:
+            GLib.idle_add(self.clear_user_off, name)
+
+    def mark_user_off(self, name):
+        if name not in self.user_off:
+            self.user_off.add(name)
+            self.log("%s: turned off at the TV; stays off until keyboard or mouse input" % name)
+            self.watch_input(self.on_input_after_user_off)
+        return False
+
+    def clear_user_off(self, name):
+        if name in self.user_off:
+            self.user_off.discard(name)
+            self.log("%s: turned on at the TV" % name)
+        return False
+
+    def on_input_after_user_off(self):
+        self.stop_input_watch()
+        self.end_network_wake()
+        if self.user_off:
+            self.log("input after the TV was turned off: powering the TV on")
+            self.user_off.clear()
+            self.each("on", [d for d in self.managed() if self.topo_ok(d)])
+
+    def manual_on(self):
+        """Tray Turn TV On: an explicit request beats 'turned off at the TV'."""
+        self.user_off.clear()
+        self.end_network_wake()
+        self.each("on")
+
+    def power_off_before(self, deadline, why):
+        """Power the managed TVs off before the inhibitor window closes (sleep, shutdown).
+        Uses the persistent connection when it is up (sent within milliseconds, before the network
+        goes down), else quick retries. Runs once per sleep even if both a pre-sleep hook (prepare_sleep) and
+        logind ask. Returns when done or at the deadline."""
+        with self.sleep_lock:
+            if time.time() - self.sleep_off_at < 30:
+                return "already done"
+            t0 = time.time()
+            blank = self.cfg["blank_instead_of_poweroff"]
+            futs = []
+            for d in self.managed():
+                p = self.persist.get(d["name"])
+                if p is not None and p.power_off_now(blank, log=self.log) is not None:
+                    continue
+                futs.append(self.pool.submit(self._locked_until, d, deadline, blank))
+            if futs:
+                wait_futures(futs, timeout=max(0, deadline - time.time()))
+            self.sleep_off_at = time.time()
+            self.log("power off before %s took %.2f s" % (why, time.time() - t0))
+            return "ok"
+
+    def _locked_until(self, d, deadline, blank):
+        # don't wait behind a long command (e.g. a 40 s power on) holding the device lock
+        lock = self.locks.setdefault(d["name"], threading.Lock())
+        got = lock.acquire(timeout=max(0, deadline - time.time() - 1.5))
+        try:
+            return webos.power_off_until(d, deadline, blank, self.log)
+        except Exception as e:
+            self.log("%s: %s" % (d["name"], e))
+        finally:
+            if got:
+                lock.release()
 
     def topo_ok(self, dev):
         """False if topology support says this TV's output is disconnected/disabled."""
@@ -138,19 +259,60 @@ class Daemon:
                 self.tray_quit = False
 
     # ------------------------------------------------------------ power
-    def on_sleep(self):
+    def on_sleep(self, window=5.0):
+        start = time.time()
+        self.power_off_before(start + window - 0.5, "sleep")
         self.event("SYSTEM_SUSPEND")
-        self.each("off", wait=True)
+        self.end_network_wake()
+        self.stop_input_watch()
+        try:
+            self.sleep_snapshot = wake.snapshot()
+        except Exception as e:
+            self.sleep_snapshot = None
+            self.log("wake source: could not read network card counters: %s" % e)
 
     def on_resume(self):
         self.event("SYSTEM_RESUME")
         self.user_idle = False
+        self.sleep_off_at = 0.0
+        self.resumed_at = time.time()
+        self.user_off.clear()             # a new wake starts fresh
+        for p in self.persist.values():
+            p.kick()                      # the old sockets died with the network during sleep
+        if self.cfg["stay_off_on_network_wake"]:
+            try:
+                source, why = wake.detect(self.sleep_snapshot)
+            except Exception as e:
+                source, why = "other", "could not tell: %s" % e
+            self.log("wake source: %s (%s)" % (source, why))
+            if source == "network":
+                self.network_woken = True
+                self.log("network wake: TV stays off until keyboard or mouse input")
+                self.watch_input(self.on_input_after_network_wake, self.on_no_input_watch)
+                return
         self.each("on", [d for d in self.managed() if self.topo_ok(d)])
 
-    def on_shutdown(self, reboot):
-        self.event("SYSTEM_REBOOT" if reboot else "SYSTEM_SHUTDOWN")
+    def on_input_after_network_wake(self):
+        self.stop_input_watch()
+        if self.end_network_wake():
+            self.log("input after network wake: powering the TV on")
+            self.each("on", [d for d in self.managed() if self.topo_ok(d)])
+
+    def on_no_input_watch(self):
+        if self.end_network_wake():
+            self.log("network wake: no input detection in this session, powering the TV on")
+            self.each("on", [d for d in self.managed() if self.topo_ok(d)])
+
+    def end_network_wake(self):
+        """Clear the network-woken mark; True if it was set."""
+        was, self.network_woken = self.network_woken, False
+        return was
+
+    def on_shutdown(self, reboot, window=5.0):
+        start = time.time()
         if not reboot:
-            self.each("off", wait=True)
+            self.power_off_before(start + window - 0.5, "shutdown")
+        self.event("SYSTEM_REBOOT" if reboot else "SYSTEM_SHUTDOWN")
 
     # ------------------------------------------------------------ idle
     def idle_excluded(self):
@@ -184,7 +346,7 @@ class Daemon:
         if self.cfg["idle"]["mute"]:
             self.each("mute")
 
-    def watch_input(self, on_input=None):
+    def watch_input(self, on_input=None, on_unavailable=None):
         """After a manual blank (tray, -idle), unblank on the next input like an idle blank does.
         A short idle timer arms once input settles; its resume is the next mouse/key event."""
         self.stop_input_watch()
@@ -197,6 +359,8 @@ class Daemon:
             self.input_watch = idle.create(0.3, lambda: None, cb(on_input or self.on_active), False)
             if self.input_watch:
                 self.input_watch.start()
+            elif on_unavailable:
+                on_unavailable()
             return False
         self.input_timer = GLib.timeout_add(1500, arm)
 
@@ -207,6 +371,8 @@ class Daemon:
 
     def on_input_after_off(self):
         self.stop_input_watch()
+        self.end_network_wake()
+        self.user_off.clear()
         self.each("on")
 
     def stop_input_watch(self):
@@ -219,6 +385,18 @@ class Daemon:
 
     def on_active(self):
         self.stop_input_watch()
+        if self.user_off:                 # first input after the TV was turned off at the TV
+            if self.user_idle:
+                self.user_idle = False
+                self.event("SYSTEM_USER_BUSY")
+            self.on_input_after_user_off()
+            return
+        if self.network_woken:            # first input after a Wake-on-LAN wake: power on, not unblank
+            if self.user_idle:
+                self.user_idle = False
+                self.event("SYSTEM_USER_BUSY")
+            self.on_input_after_network_wake()
+            return
         if not self.user_idle:
             return
         self.user_idle = False
@@ -258,7 +436,7 @@ class Daemon:
             if was is None or was == now:
                 continue
             self.log("%s: output %s %s" % (d["name"], c["connector"], "active" if now else "inactive"))
-            if now and not self.user_idle and not self.streaming:
+            if now and not self.user_idle and not self.streaming and not self.network_woken:
                 self.each("on", [d])
             elif not now:
                 self.each("off", [d])
@@ -278,6 +456,8 @@ class Daemon:
         if not now:
             self.event("SYSTEM_DISPLAYS_OFF")
             self.each("off", [d])
+        elif self.network_woken:
+            self.log("%s: display on after a network wake, TV stays off until input" % d["name"])
         else:
             self.event("SYSTEM_DISPLAYS_ON")
             self.user_idle = False
@@ -327,9 +507,11 @@ class Daemon:
         if cmd == "autoenable":
             self.session_off.difference_update(names)
             self.session_on.update(names)
+            self.sync_persistent()
         elif cmd == "autodisable":
             self.session_on.difference_update(names)
             self.session_off.update(names)
+            self.sync_persistent()
         elif cmd == "idle":
             if not self.cfg["idle"]["enabled"]:
                 return "user idle mode is not enabled"
@@ -354,6 +536,7 @@ class Daemon:
         self.topo = {}
         self.start_idle()
         self.apply_tray()
+        self.sync_persistent()
         self.log("configuration reloaded")
         return False
 
@@ -382,12 +565,14 @@ class Daemon:
                 line = line.strip()
                 if not line:
                     continue
-                if line == "reload":
+                if line == "prepare_sleep":    # for system hooks: the network is about to go down
+                    res = {"result": self.power_off_before(time.time() + 4, "sleep (network going down)")}
+                elif line == "reload":
                     GLib.idle_add(self.reload)
                     res = {"result": "ok"}
                 elif line == "status":
                     res = {"user_idle": self.user_idle, "streaming": self.streaming, "tray": self.tray.registered,
-                           "keep_screen_on": self.keep.active,
+                           "keep_screen_on": self.keep.active, "network_woken": self.network_woken,
                            "idle_backend": self.idle_backend.name if self.idle_backend else None,
                            "managed": [d["name"] for d in self.managed()], "topology": self.topo}
                 else:
@@ -404,21 +589,32 @@ class Daemon:
                     self.clients.remove(c)
             c.close()
 
+    def power_on_at_start(self, check=startup.check):
+        """Boot/login (or recent input): power on, unless topology says the TV's output is off.
+        A plain service restart leaves the TV as it is."""
+        try:
+            on, why = check()
+        except Exception as e:
+            on, why = True, "could not tell (%s)" % e
+        self.log("start: %s" % why)
+        if on:
+            self.each("on", [d for d in self.managed() if self.cfg["topology"]["keep_on_boot"] or self.topo_ok(d)])
+
     # ------------------------------------------------------------ main
     def run(self):
         loop = GLib.MainLoop()
         self.log("LGTV Daemon daemon starting, %d device(s)" % len(self.cfg["devices"]))
         try:
             from .power import Power
-            self.power = Power(lambda: self.on_sleep(), lambda: self.on_resume(), lambda r: self.on_shutdown(r), self.log)
+            self.power = Power(lambda w: self.on_sleep(w), lambda: self.on_resume(),
+                               lambda r, w: self.on_shutdown(r, w), self.log)
         except Exception as e:
             self.log("logind unavailable: %s" % e)
         self.serve()
         self.start_idle()
         self.apply_tray()
-        # boot/login: power on (unless topology says the TV's output is off)
-        boot = [d for d in self.managed() if self.cfg["topology"]["keep_on_boot"] or self.topo_ok(d)]
-        self.each("on", boot)
+        self.power_on_at_start()
+        self.sync_persistent()
         GLib.timeout_add_seconds(2, self.poll_topology)
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGHUP, self.reload)
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: loop.quit() or False)
