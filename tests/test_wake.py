@@ -127,6 +127,7 @@ class FakeDaemon:
                     "api": {"enabled": False}}
         self.network_woken = self.user_idle = False
         self.sleep_snapshot = None
+        self.persist, self.user_off, self.sleep_off_at, self.resumed_at = {}, set(), 0.0, 0.0
         self.calls, self.logs, self.watch = [], [], None
         daemon.wake.detect = lambda before: source
 
