@@ -34,6 +34,7 @@ DEFAULTS = {
     "tray": True,                 # show the tray icon
     "power_on_timeout": 40,
     "blank_instead_of_poweroff": False,
+    "stay_off_on_network_wake": True,  # Wake-on-LAN wake: TV stays off until keyboard/mouse input
     "idle": {
         "enabled": False,
         "minutes": 10,

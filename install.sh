@@ -59,6 +59,16 @@ else
     echo "no active ufw or firewalld, nothing to do"
 fi
 
+echo "== wake-source hook (keeps the TV off after a Wake-on-LAN wake)"
+# Runs as root around each suspend: reads which device sent the PCIe wake message (needs root).
+SLEEP_HOOKS=/usr/lib/systemd/system-sleep
+if has_systemd && [ -d "$SLEEP_HOOKS" ]; then
+    $SUDO install -m 755 "$SRC/lgtvc/wake.py" "$SLEEP_HOOKS/lgtv-daemon-wake" \
+        || echo "could not install the hook; network wakes will turn the TV on like any other wake"
+else
+    echo "no systemd sleep hooks directory; network wakes will turn the TV on like any other wake"
+fi
+
 echo "== service"
 # Autostart works everywhere: with systemd it hands the session environment to the user unit (for
 # desktops that never start graphical-session.target: i3, startx...), otherwise it runs the daemon.

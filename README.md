@@ -10,6 +10,10 @@ Persson. It aims to match its features and settings, and the command line is com
 
 - TV turns off at shutdown and before sleep, and back on at boot and after resume. Reboots are
   left alone.
+- Wake-on-LAN aware: if the PC was woken over the network (for example a remote job), the TV
+  stays off until you touch the keyboard or mouse. Woken by keyboard, mouse or power button, it
+  turns on as usual. On by default ("Keep TV off after a network wake"; config key
+  `stay_off_on_network_wake`). See [Network wake](#network-wake).
 - Idle blanking: blank the screen after a set time without input and bring it back on the next
   input. Paused while video is playing or while chosen programs run.
 - Follows your display setup: if the TV's output is disabled or unplugged, the TV turns off.
@@ -85,6 +89,21 @@ as unavailable in the settings rather than failing.
 
 Settings are stored in `~/.config/lgtv-daemon/config.json`, the log in
 `~/.local/state/lgtv-daemon/log.txt`.
+
+## Network wake
+
+To tell a network wake from any other, `install.sh` adds a small root hook,
+`/usr/lib/systemd/system-sleep/lgtv-daemon-wake` (it is `lgtvc/wake.py`). Before suspend it clears
+the PCIe root ports' "PME Status"; after resume it records which device sent the wake message
+in `/run/lgtv-daemon-wake.json`. If that device is a network card, the daemon skips the resume
+power-on and waits for the first keyboard or mouse input. Where the kernel itself counts the
+wake (the network card's `power/wakeup_count` goes up), that is used too. The log says which
+path was taken (`wake source: network (...)` or `wake source: other (...)`).
+
+Anything unclear counts as an ordinary wake, so without the hook, or on hardware where neither
+signal is available, the TV turns on at resume as before. Wake-on-LAN itself must be enabled on
+the network card (`ethtool -s <interface> wol g`) and in the firmware; this feature only decides
+what the TV does afterwards.
 
 ## Development
 

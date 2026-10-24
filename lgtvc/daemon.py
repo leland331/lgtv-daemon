@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from gi.repository import GLib
 
-from . import commands, config, idle, topology, webos
+from . import commands, config, idle, topology, wake, webos
 from .keepawake import KeepAwake
 from .tray import Tray
 
@@ -28,6 +28,8 @@ class Daemon:
         self.input_watch = None       # manual blank/off: short idle watcher, wakes the TV on input
         self.session_on = set()       # -autoenable  (until restart)
         self.user_idle = False
+        self.network_woken = False    # woken by Wake-on-LAN: TV stays off until keyboard/mouse input
+        self.sleep_snapshot = None    # network-card wakeup counters taken before sleep
         self.streaming = False
         self.topo = {}
         self.dpms = {}
@@ -140,12 +142,46 @@ class Daemon:
     # ------------------------------------------------------------ power
     def on_sleep(self):
         self.event("SYSTEM_SUSPEND")
+        self.end_network_wake()
+        self.stop_input_watch()
+        try:
+            self.sleep_snapshot = wake.snapshot()
+        except Exception as e:
+            self.sleep_snapshot = None
+            self.log("wake source: could not read network card counters: %s" % e)
         self.each("off", wait=True)
 
     def on_resume(self):
         self.event("SYSTEM_RESUME")
         self.user_idle = False
+        if self.cfg["stay_off_on_network_wake"]:
+            try:
+                source, why = wake.detect(self.sleep_snapshot)
+            except Exception as e:
+                source, why = "other", "could not tell: %s" % e
+            self.log("wake source: %s (%s)" % (source, why))
+            if source == "network":
+                self.network_woken = True
+                self.log("network wake: TV stays off until keyboard or mouse input")
+                self.watch_input(self.on_input_after_network_wake, self.on_no_input_watch)
+                return
         self.each("on", [d for d in self.managed() if self.topo_ok(d)])
+
+    def on_input_after_network_wake(self):
+        self.stop_input_watch()
+        if self.end_network_wake():
+            self.log("input after network wake: powering the TV on")
+            self.each("on", [d for d in self.managed() if self.topo_ok(d)])
+
+    def on_no_input_watch(self):
+        if self.end_network_wake():
+            self.log("network wake: no input detection in this session, powering the TV on")
+            self.each("on", [d for d in self.managed() if self.topo_ok(d)])
+
+    def end_network_wake(self):
+        """Clear the network-woken mark; True if it was set."""
+        was, self.network_woken = self.network_woken, False
+        return was
 
     def on_shutdown(self, reboot):
         self.event("SYSTEM_REBOOT" if reboot else "SYSTEM_SHUTDOWN")
@@ -184,7 +220,7 @@ class Daemon:
         if self.cfg["idle"]["mute"]:
             self.each("mute")
 
-    def watch_input(self, on_input=None):
+    def watch_input(self, on_input=None, on_unavailable=None):
         """After a manual blank (tray, -idle), unblank on the next input like an idle blank does.
         A short idle timer arms once input settles; its resume is the next mouse/key event."""
         self.stop_input_watch()
@@ -197,6 +233,8 @@ class Daemon:
             self.input_watch = idle.create(0.3, lambda: None, cb(on_input or self.on_active), False)
             if self.input_watch:
                 self.input_watch.start()
+            elif on_unavailable:
+                on_unavailable()
             return False
         self.input_timer = GLib.timeout_add(1500, arm)
 
@@ -207,6 +245,7 @@ class Daemon:
 
     def on_input_after_off(self):
         self.stop_input_watch()
+        self.end_network_wake()
         self.each("on")
 
     def stop_input_watch(self):
@@ -219,6 +258,12 @@ class Daemon:
 
     def on_active(self):
         self.stop_input_watch()
+        if self.network_woken:            # first input after a Wake-on-LAN wake: power on, not unblank
+            if self.user_idle:
+                self.user_idle = False
+                self.event("SYSTEM_USER_BUSY")
+            self.on_input_after_network_wake()
+            return
         if not self.user_idle:
             return
         self.user_idle = False
@@ -258,7 +303,7 @@ class Daemon:
             if was is None or was == now:
                 continue
             self.log("%s: output %s %s" % (d["name"], c["connector"], "active" if now else "inactive"))
-            if now and not self.user_idle and not self.streaming:
+            if now and not self.user_idle and not self.streaming and not self.network_woken:
                 self.each("on", [d])
             elif not now:
                 self.each("off", [d])
@@ -278,6 +323,8 @@ class Daemon:
         if not now:
             self.event("SYSTEM_DISPLAYS_OFF")
             self.each("off", [d])
+        elif self.network_woken:
+            self.log("%s: display on after a network wake, TV stays off until input" % d["name"])
         else:
             self.event("SYSTEM_DISPLAYS_ON")
             self.user_idle = False
@@ -387,7 +434,7 @@ class Daemon:
                     res = {"result": "ok"}
                 elif line == "status":
                     res = {"user_idle": self.user_idle, "streaming": self.streaming, "tray": self.tray.registered,
-                           "keep_screen_on": self.keep.active,
+                           "keep_screen_on": self.keep.active, "network_woken": self.network_woken,
                            "idle_backend": self.idle_backend.name if self.idle_backend else None,
                            "managed": [d["name"] for d in self.managed()], "topology": self.topo}
                 else:
