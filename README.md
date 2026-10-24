@@ -9,7 +9,8 @@ Persson. It aims to match its features and settings, and the command line is com
 ## Features
 
 - TV turns off at shutdown and before sleep, and back on at boot and after resume. Reboots are
-  left alone.
+  left alone. A persistent connection to each TV (like LGTV Companion's) makes the power-off at
+  sleep instant; see [Sleep and shutdown](#sleep-and-shutdown).
 - Wake-on-LAN aware: if the PC was woken over the network (for example a remote job), the TV
   stays off until you touch the keyboard or mouse. Woken by keyboard, mouse or power button, it
   turns on as usual. On by default ("Keep TV off after a network wake"; config key
@@ -104,6 +105,29 @@ Anything unclear counts as an ordinary wake, so without the hook, or on hardware
 signal is available, the TV turns on at resume as before. Wake-on-LAN itself must be enabled on
 the network card (`ethtool -s <interface> wol g`) and in the firmware; this feature only decides
 what the TV does afterwards.
+
+## Sleep and shutdown
+
+The PC gives programs only a few seconds before it sleeps, and NetworkManager disconnects the
+network almost at once (within a few hundredths of a second), so connecting to the TV at that
+moment often fails. Three things make the power-off reliable:
+
+- **Persistent connection** (on by default; "Persistent connection", config key
+  `persistent_connection`). The daemon keeps a connection open to each paired TV and follows its
+  power state, reconnecting in the background (1 s, growing to 20 s between tries) and sending a
+  small keepalive every 20 s. At sleep the power-off goes out over it straight away. If it is down,
+  the daemon makes up to three quick connection attempts (1.5 s each) within the time logind allows.
+- **NetworkManager hook.** `install.sh` adds
+  `/etc/NetworkManager/dispatcher.d/pre-down.d/90-lgtv-daemon`. NetworkManager runs it, and waits
+  for it, before taking an interface down; when it is going to sleep, the hook asks the daemon to
+  turn the TVs off first. At any other time it does nothing.
+- **Longer delay window.** logind lets programs hold sleep and shutdown for 5 s by default.
+  `install.sh` raises this to 15 s with `/etc/systemd/logind.conf.d/50-lgtv-daemon.conf`, unless
+  `InhibitDelayMaxSec` is already set somewhere else. **It takes effect after the next reboot**:
+  logind can't reload it without restarting, and restarting logind logs you out. The daemon holds
+  sleep only until the TV has been told to turn off (usually a few milliseconds).
+
+`uninstall.sh` removes the hook and the logind file.
 
 ## Development
 

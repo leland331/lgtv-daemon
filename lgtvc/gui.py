@@ -324,6 +324,9 @@ class Window(Adw.ApplicationWindow):
         g.add(switch_row("Keep TV off after a network wake", "When the PC is woken over the network "
                          "(Wake-on-LAN), leave the TV off until you use the keyboard or mouse.",
                          c["stay_off_on_network_wake"], top("stay_off_on_network_wake")))
+        g.add(switch_row("Persistent connection", "Keep a connection open to each TV so it can be turned "
+                         "off instantly when the PC sleeps or shuts down.",
+                         c["persistent_connection"], top("persistent_connection")))
         page.add(g)
 
         g = Adw.PreferencesGroup(title="User idle mode", description="Blank the TV screen when you've been away "

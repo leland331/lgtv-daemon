@@ -7,11 +7,11 @@ import socket
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
 
 from gi.repository import GLib
 
-from . import commands, config, idle, topology, wake, webos
+from . import commands, config, idle, persist, topology, wake, webos
 from .keepawake import KeepAwake
 from .tray import Tray
 
@@ -31,6 +31,9 @@ class Daemon:
         self.network_woken = False    # woken by Wake-on-LAN: TV stays off until keyboard/mouse input
         self.sleep_snapshot = None    # network-card wakeup counters taken before sleep
         self.streaming = False
+        self.persist = {}             # device name -> persist.Persistent
+        self.sleep_lock = threading.Lock()
+        self.sleep_off_at = 0.0       # when the TVs were last powered off for sleep/shutdown
         self.topo = {}
         self.dpms = {}
         self.idle_backend = None
@@ -86,7 +89,7 @@ class Daemon:
         futs = []
         for d in devices:
             if action == "on":
-                f = (webos.power_on, d, self.cfg["power_on_timeout"], self.log)
+                f = (self._power_on, d)
             elif action == "off":
                 f = (webos.power_off, d, self.cfg["blank_instead_of_poweroff"], self.log)
             elif action == "off_forced":   # user's own command: skip the HDMI input check
@@ -103,6 +106,60 @@ class Daemon:
         if wait:
             for f in futs:
                 f.result()
+
+    def _power_on(self, d):
+        ok = webos.power_on(d, self.cfg["power_on_timeout"], self.log)
+        p = self.persist.get(d["name"])
+        if ok and p and not p.alive():
+            p.kick()
+        return ok
+
+    # ------------------------------------------------------------ persistent connections
+    def sync_persistent(self):
+        """Keep one persistent connection per managed, paired TV (config: persistent_connection)."""
+        want = {d["name"]: d for d in self.managed() if d["key"]} if self.cfg["persistent_connection"] else {}
+        for name in list(self.persist):
+            p = self.persist[name]
+            if name not in want or not p.same_device(want[name]):
+                p.stop()
+                del self.persist[name]
+        for name, d in want.items():
+            if name not in self.persist:
+                self.persist[name] = persist.Persistent(d, self.log).start()
+
+    def power_off_before(self, deadline, why):
+        """Power the managed TVs off before the inhibitor window closes (sleep, shutdown).
+        Uses the persistent connection when it is up (sent within milliseconds, before the network
+        goes down), else quick retries. Runs once per sleep even if both the NetworkManager hook and
+        logind ask. Returns when done or at the deadline."""
+        with self.sleep_lock:
+            if time.time() - self.sleep_off_at < 30:
+                return "already done"
+            t0 = time.time()
+            blank = self.cfg["blank_instead_of_poweroff"]
+            futs = []
+            for d in self.managed():
+                p = self.persist.get(d["name"])
+                if p is not None and p.power_off_now(blank, log=self.log) is not None:
+                    continue
+                futs.append(self.pool.submit(self._locked_until, d, deadline, blank))
+            if futs:
+                wait_futures(futs, timeout=max(0, deadline - time.time()))
+            self.sleep_off_at = time.time()
+            self.log("power off before %s took %.2f s" % (why, time.time() - t0))
+            return "ok"
+
+    def _locked_until(self, d, deadline, blank):
+        # don't wait behind a long command (e.g. a 40 s power on) holding the device lock
+        lock = self.locks.setdefault(d["name"], threading.Lock())
+        got = lock.acquire(timeout=max(0, deadline - time.time() - 1.5))
+        try:
+            return webos.power_off_until(d, deadline, blank, self.log)
+        except Exception as e:
+            self.log("%s: %s" % (d["name"], e))
+        finally:
+            if got:
+                lock.release()
 
     def topo_ok(self, dev):
         """False if topology support says this TV's output is disconnected/disabled."""
@@ -140,7 +197,9 @@ class Daemon:
                 self.tray_quit = False
 
     # ------------------------------------------------------------ power
-    def on_sleep(self):
+    def on_sleep(self, window=5.0):
+        start = time.time()
+        self.power_off_before(start + window - 0.5, "sleep")
         self.event("SYSTEM_SUSPEND")
         self.end_network_wake()
         self.stop_input_watch()
@@ -149,11 +208,13 @@ class Daemon:
         except Exception as e:
             self.sleep_snapshot = None
             self.log("wake source: could not read network card counters: %s" % e)
-        self.each("off", wait=True)
 
     def on_resume(self):
         self.event("SYSTEM_RESUME")
         self.user_idle = False
+        self.sleep_off_at = 0.0
+        for p in self.persist.values():
+            p.kick()                      # the old sockets died with the network during sleep
         if self.cfg["stay_off_on_network_wake"]:
             try:
                 source, why = wake.detect(self.sleep_snapshot)
@@ -183,10 +244,11 @@ class Daemon:
         was, self.network_woken = self.network_woken, False
         return was
 
-    def on_shutdown(self, reboot):
-        self.event("SYSTEM_REBOOT" if reboot else "SYSTEM_SHUTDOWN")
+    def on_shutdown(self, reboot, window=5.0):
+        start = time.time()
         if not reboot:
-            self.each("off", wait=True)
+            self.power_off_before(start + window - 0.5, "shutdown")
+        self.event("SYSTEM_REBOOT" if reboot else "SYSTEM_SHUTDOWN")
 
     # ------------------------------------------------------------ idle
     def idle_excluded(self):
@@ -374,9 +436,11 @@ class Daemon:
         if cmd == "autoenable":
             self.session_off.difference_update(names)
             self.session_on.update(names)
+            self.sync_persistent()
         elif cmd == "autodisable":
             self.session_on.difference_update(names)
             self.session_off.update(names)
+            self.sync_persistent()
         elif cmd == "idle":
             if not self.cfg["idle"]["enabled"]:
                 return "user idle mode is not enabled"
@@ -401,6 +465,7 @@ class Daemon:
         self.topo = {}
         self.start_idle()
         self.apply_tray()
+        self.sync_persistent()
         self.log("configuration reloaded")
         return False
 
@@ -429,7 +494,9 @@ class Daemon:
                 line = line.strip()
                 if not line:
                     continue
-                if line == "reload":
+                if line == "prepare_sleep":    # NetworkManager pre-down hook: network is about to go
+                    res = {"result": self.power_off_before(time.time() + 4, "sleep (network going down)")}
+                elif line == "reload":
                     GLib.idle_add(self.reload)
                     res = {"result": "ok"}
                 elif line == "status":
@@ -457,7 +524,8 @@ class Daemon:
         self.log("LGTV Daemon daemon starting, %d device(s)" % len(self.cfg["devices"]))
         try:
             from .power import Power
-            self.power = Power(lambda: self.on_sleep(), lambda: self.on_resume(), lambda r: self.on_shutdown(r), self.log)
+            self.power = Power(lambda w: self.on_sleep(w), lambda: self.on_resume(),
+                               lambda r, w: self.on_shutdown(r, w), self.log)
         except Exception as e:
             self.log("logind unavailable: %s" % e)
         self.serve()
@@ -466,6 +534,7 @@ class Daemon:
         # boot/login: power on (unless topology says the TV's output is off)
         boot = [d for d in self.managed() if self.cfg["topology"]["keep_on_boot"] or self.topo_ok(d)]
         self.each("on", boot)
+        self.sync_persistent()
         GLib.timeout_add_seconds(2, self.poll_topology)
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGHUP, self.reload)
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: loop.quit() or False)

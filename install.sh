@@ -69,6 +69,35 @@ else
     echo "no systemd sleep hooks directory; network wakes will turn the TV on like any other wake"
 fi
 
+echo "== NetworkManager hook (turns the TV off before sleep takes the network down)"
+# NetworkManager disconnects every interface the moment sleep starts, often before the TV has
+# been told to turn off. Its pre-down hooks run first, and it waits for them.
+NM_HOOKS=/etc/NetworkManager/dispatcher.d/pre-down.d
+if [ -d "$NM_HOOKS" ]; then
+    $SUDO install -m 755 "$SRC/packaging/nm-pre-down-lgtv-daemon" "$NM_HOOKS/90-lgtv-daemon" \
+        || echo "could not install the hook; the TV may not turn off at sleep if NetworkManager is fast"
+else
+    echo "no NetworkManager dispatcher directory, nothing to do"
+fi
+
+echo "== logind sleep delay (time to turn the TV off before sleep/shutdown)"
+# logind lets programs delay sleep for only 5 s by default. Raise it to 15 s unless another
+# InhibitDelayMaxSec setting is already in place. Takes effect after the next reboot: logind can't
+# reload it without a restart, and restarting logind would log you out.
+LOGIND_DROPIN=/etc/systemd/logind.conf.d/50-lgtv-daemon.conf
+if has_systemd; then
+    other=$(grep -lsE '^[[:space:]]*InhibitDelayMaxSec=' /etc/systemd/logind.conf /etc/systemd/logind.conf.d/*.conf \
+            /run/systemd/logind.conf.d/*.conf /usr/lib/systemd/logind.conf.d/*.conf /usr/local/lib/systemd/logind.conf.d/*.conf \
+            2>/dev/null | grep -v "^$LOGIND_DROPIN\$")
+    if [ -n "$other" ]; then
+        echo "InhibitDelayMaxSec is already set in: $other - leaving it alone"
+    else
+        $SUDO mkdir -p /etc/systemd/logind.conf.d
+        printf '# Installed by LGTV Daemon: give it time to turn the TV off before sleep/shutdown.\n[Login]\nInhibitDelayMaxSec=15\n' \
+            | $SUDO tee "$LOGIND_DROPIN" >/dev/null && echo "set InhibitDelayMaxSec=15 (takes effect after the next reboot)"
+    fi
+fi
+
 echo "== service"
 # Autostart works everywhere: with systemd it hands the session environment to the user unit (for
 # desktops that never start graphical-session.target: i3, startx...), otherwise it runs the daemon.

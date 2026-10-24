@@ -177,6 +177,18 @@ def off_decision(dev, state, app, blank, forced):
     return False, "Foreground app is %s. %s" % (app or "unknown", neg)
 
 
+def _off_with(tv, dev, blank, log, forced):
+    st = tv.power_state()
+    app = None
+    if dev.get("check_hdmi_input_when_power_off") and not forced and st in ("Active", "Screen Off"):
+        app = tv.request("com.webos.applicationManager/getForegroundAppInfo").get("appId", "")
+    act, why = off_decision(dev, st, app, blank, forced)
+    log("%s: %s" % (dev["name"], why))
+    if act:
+        tv.request("com.webos.service.tvpower/power/turnOffScreen" if blank else "system/turnOff")
+    return act
+
+
 def power_off(dev, blank=False, log=print, forced=False, connect_fn=None):
     connect_fn = connect_fn or (lambda d: connect(d, timeout=3, pair_timeout=5))
     try:
@@ -185,17 +197,36 @@ def power_off(dev, blank=False, log=print, forced=False, connect_fn=None):
         log("%s: power off skipped: %s" % (dev["name"], e))
         return False
     try:
-        st = tv.power_state()
-        app = None
-        if dev.get("check_hdmi_input_when_power_off") and not forced and st in ("Active", "Screen Off"):
-            app = tv.request("com.webos.applicationManager/getForegroundAppInfo").get("appId", "")
-        act, why = off_decision(dev, st, app, blank, forced)
-        log("%s: %s" % (dev["name"], why))
-        if act:
-            tv.request("com.webos.service.tvpower/power/turnOffScreen" if blank else "system/turnOff")
-        return act
+        return _off_with(tv, dev, blank, log, forced)
     finally:
         tv.close()
+
+
+def power_off_until(dev, deadline, blank=False, log=print, connect_fn=None, tries=3):
+    """Power off before a hard deadline (suspend/shutdown inhibitor window): short timeouts and
+    a few quick retries instead of one long connect."""
+    connect_fn = connect_fn or (lambda d, t: connect(d, timeout=t, pair_timeout=t))
+    err = "no time left"
+    for _ in range(tries):
+        left = deadline - time.time()
+        if left < 0.3:
+            break
+        t = min(1.5, left)
+        try:
+            tv = connect_fn(dev, t)
+        except TVError as e:
+            err = str(e)
+            time.sleep(min(0.2, max(0, deadline - time.time() - 0.3)))
+            continue
+        try:
+            tv.timeout = max(0.3, min(tv.timeout, deadline - time.time()))
+            return _off_with(tv, dev, blank, log, False)
+        except (OSError, WSError, ValueError) as e:
+            err = str(e)
+        finally:
+            tv.close()
+    log("%s: power off skipped: %s" % (dev["name"], err))
+    return False
 
 
 def screen_on(dev, log=print):
