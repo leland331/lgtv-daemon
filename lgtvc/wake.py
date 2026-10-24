@@ -1,192 +1,127 @@
-#!/usr/bin/env python3
 """What woke the PC: the network card (Wake-on-LAN) or something else (keyboard, mouse, power button).
 
-Standalone, standard library only: install.sh also copies this file as a systemd system-sleep hook
-(/usr/lib/systemd/system-sleep/lgtv-daemon-wake), which runs as root around every suspend.
+Uses only what the kernel exposes to ordinary users, compared before and after the sleep:
 
-Why a root hook: on many desktops the kernel records nothing user-visible for a Wake-on-LAN wake.
-The network card's own wakeup counter (/sys/class/net/<if>/device/power/wakeup_count) only moves
-when the kernel's PCIe PME driver handles the wake, and on boards where the firmware owns PME
-(common on AMD desktops) it stays at 0. What does survive is the PCIe root port's Root Status
-register: it latches "PME Status" plus the requester ID (bus:device.function) of the device that
-sent the wake message. That register needs root to read, so the hook clears it before suspend
-('pre') and records it after resume ('post') in STATE_FILE, which the user daemon reads.
+  - each network card's wakeup counter   /sys/class/net/<if>/device/power/wakeup_count
+  - the kernel's wakeup sources          /sys/class/wakeup/*/  (entries that belong to a network card)
+  - the IRQ that woke the system         /sys/power/pm_wakeup_irq (when the platform records it)
 
-The daemon decides "network" if the recorded requester is a network card, or (on machines where the
-kernel does count it) if a network card's wakeup counter went up across the sleep. Anything else,
-including a missing hook, counts as an ordinary wake, so the TV behaves as it always did."""
+Some machines record none of these for a Wake-on-LAN wake (the firmware handles the wake and the
+kernel never sees it). For those, a system integrator can install a small root hook that finds out
+in a machine-specific way and writes WAKE_SOURCE_FILE after each resume:
+
+    {"time": <unix time, written after resume>, "source": "network" | "other", "detail": "<free text>"}
+
+The daemon trusts that file when it was written after the sleep began. Anything unclear counts as an
+ordinary wake, so the TV behaves as it always did."""
 import json
 import os
-import struct
-import sys
 import time
 
-STATE_FILE = "/run/lgtv-daemon-wake.json"
-PCI_DEVICES = "/sys/bus/pci/devices"
+WAKE_SOURCE_FILE = "/run/lgtv-daemon-wake.json"
 NET_CLASS = "/sys/class/net"
-
-PCI_CAP_EXP = 0x10          # PCI Express capability ID
-ROOT_STATUS = 0x20          # Root Status, offset inside the PCIe capability
-PME_STATUS = 1 << 16        # RW1C: a PME message was received; bits 15:0 hold its requester ID
-PORT_ROOT, PORT_RCEC = 0x4, 0xA
+WAKEUP_CLASS = "/sys/class/wakeup"
+WAKEUP_IRQ = "/sys/power/pm_wakeup_irq"
 
 
-# ------------------------------------------------------------ config-space parsing (pure)
-def pcie_cap(cfg):
-    """Offset of the PCI Express capability in config space bytes, or None."""
-    if len(cfg) < 0x40 or not (struct.unpack_from("<H", cfg, 0x06)[0] & 0x10):  # no capability list
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
         return None
-    off, seen = cfg[0x34] & 0xFC, set()
-    while off and off not in seen and off + 2 <= len(cfg):
-        seen.add(off)
-        if cfg[off] == PCI_CAP_EXP:
-            return off
-        off = cfg[off + 1] & 0xFC
-    return None
 
 
-def root_status(cfg):
-    """(offset of Root Status, its value) for a PCIe root port, else None."""
-    cap = pcie_cap(cfg)
-    if cap is None or cap + ROOT_STATUS + 4 > len(cfg):
+def _int(path):
+    try:
+        return int(_read(path) or "")
+    except ValueError:
         return None
-    port_type = (struct.unpack_from("<H", cfg, cap + 2)[0] >> 4) & 0xF
-    if port_type not in (PORT_ROOT, PORT_RCEC):
-        return None
-    return cap + ROOT_STATUS, struct.unpack_from("<I", cfg, cap + ROOT_STATUS)[0]
 
 
-def requester(port_addr, value):
-    """'0000:06:00.0' style address of the device that sent the PME, from the Root Status value."""
-    rid = value & 0xFFFF
-    domain = port_addr.split(":")[0] if port_addr.count(":") == 2 else "0000"
-    return "%s:%02x:%02x.%x" % (domain, rid >> 8, (rid >> 3) & 0x1F, rid & 7)
-
-
-# ------------------------------------------------------------ root hook
-def _root_ports(base):
-    for addr in sorted(os.listdir(base)):
-        path = os.path.join(base, addr, "config")
-        try:
-            with open(path, "rb") as f:
-                cfg = f.read(256)
-        except OSError:
-            continue
-        rs = root_status(cfg)
-        if rs:
-            yield addr, path, rs[0], rs[1]
-
-
-def latched(base=PCI_DEVICES):
-    """[{'port', 'requester'}] for every root port that has PME Status set."""
-    return [{"port": a, "requester": requester(a, v)} for a, _, _, v in _root_ports(base) if v & PME_STATUS]
-
-
-def clear(base=PCI_DEVICES):
-    for _, path, off, v in _root_ports(base):
-        if v & PME_STATUS:
-            fd = os.open(path, os.O_WRONLY)
-            try:
-                os.pwrite(fd, struct.pack("<I", PME_STATUS), off)   # write 1 to clear
-            finally:
-                os.close(fd)
-
-
-def _write_state(data, path):
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f)
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, path)
-
-
-def hook(phase, base=PCI_DEVICES, path=STATE_FILE, wait=0.5):
-    """systemd-sleep calls this with 'pre' before suspend and 'post' after resume."""
-    if phase == "pre":
-        clear(base)
-        _write_state({"phase": "pre", "time": time.time()}, path)
-    elif phase == "post":
-        pme = latched(base)
-        end = time.monotonic() + wait
-        while not pme and time.monotonic() < end:   # the wake message can trail the resume slightly
-            time.sleep(0.1)
-            pme = latched(base)
-        _write_state({"phase": "post", "time": time.time(), "pme": pme}, path)
-
-
-# ------------------------------------------------------------ user side
 def network_cards(net=NET_CLASS):
-    """{pci address: interface name} for network interfaces backed by a PCI device."""
+    """{interface name: real path of its hardware device} (virtual interfaces have no device)."""
     out = {}
     try:
         names = os.listdir(net)
     except OSError:
         return out
     for name in names:
-        dev = os.path.realpath(os.path.join(net, name, "device"))
-        if "/pci" in dev and os.path.exists(dev):
-            out[os.path.basename(dev)] = name
+        link = os.path.join(net, name, "device")
+        if os.path.exists(link):
+            out[name] = os.path.realpath(link)
     return out
 
 
-def wakeup_counts(net=NET_CLASS):
+def wakeup_counts(net=NET_CLASS, wakeup=WAKEUP_CLASS):
+    """{key: count} for every wakeup counter that belongs to a network card."""
+    cards = network_cards(net)
     out = {}
-    for name in network_cards(net).values():
+    for name, dev in cards.items():
+        n = _int(os.path.join(dev, "power", "wakeup_count"))
+        if n is not None:
+            out[name] = n
+    devs = {dev: name for name, dev in cards.items()}
+    try:
+        sources = os.listdir(wakeup)
+    except OSError:
+        sources = []
+    for ws in sources:
+        base = os.path.join(wakeup, ws)
+        name = devs.get(os.path.realpath(os.path.join(base, "device")))   # the device that owns the source
+        if name:
+            n = _int(os.path.join(base, "wakeup_count"))
+            if n is not None:
+                out["%s/%s" % (name, ws)] = n
+    return out
+
+
+def card_irqs(net=NET_CLASS):
+    """{irq number: interface name} for the network cards' interrupts (legacy and MSI)."""
+    out = {}
+    for name, dev in network_cards(net).items():
+        irq = _int(os.path.join(dev, "irq"))
+        if irq:
+            out[irq] = name
         try:
-            with open(os.path.join(net, name, "device", "power", "wakeup_count")) as f:
-                out[name] = int(f.read().strip() or 0)
-        except (OSError, ValueError):
+            for m in os.listdir(os.path.join(dev, "msi_irqs")):
+                if m.isdigit():
+                    out[int(m)] = name
+        except OSError:
             pass
     return out
 
 
-def snapshot(net=NET_CLASS):
+def snapshot(net=NET_CLASS, wakeup=WAKEUP_CLASS):
     """Taken just before sleep; compared against after resume."""
-    return {"time": time.time(), "counts": wakeup_counts(net)}
+    return {"time": time.time(), "counts": wakeup_counts(net, wakeup)}
 
 
-def read_state(path=STATE_FILE):
+def read_wake_source(path=WAKE_SOURCE_FILE):
     try:
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
 
 
-def decide(before, after_counts, state, cards):
+def decide(before, after_counts, wake_irq, irqs, hook):
     """('network' | 'other', reason). Pure: all inputs are plain values so it can be tested.
 
     before: snapshot() from before the sleep (or None); after_counts: wakeup_counts() now;
-    state: the hook's STATE_FILE contents (or None); cards: network_cards()."""
+    wake_irq: /sys/power/pm_wakeup_irq (or None); irqs: card_irqs(); hook: WAKE_SOURCE_FILE contents."""
     since = (before or {}).get("time", 0)
-    if state and state.get("phase") == "post" and state.get("time", 0) >= since:
-        for p in state.get("pme") or []:
-            if p.get("requester") in cards:
-                return "network", "PCIe wake message from %s (%s)" % (p["requester"], cards[p["requester"]])
-    for name, n in sorted(after_counts.items()):
-        was = (before or {}).get("counts", {}).get(name)
+    if hook and hook.get("source") in ("network", "other") and hook.get("time", 0) >= since > 0:
+        return hook["source"], "wake-source file: %s" % (hook.get("detail") or hook["source"])
+    for key, n in sorted(after_counts.items()):
+        was = (before or {}).get("counts", {}).get(key)
         if was is not None and n > was:
-            return "network", "%s wakeup count went from %d to %d" % (name, was, n)
-    if not state or state.get("phase") != "post" or state.get("time", 0) < since:
-        return "other", "no network wake seen (wake-source hook not installed or did not run)"
-    if state.get("pme"):
-        return "other", "woken by %s" % ", ".join(p["requester"] for p in state["pme"])
+            return "network", "%s wakeup count went from %d to %d" % (key, was, n)
+    if wake_irq and wake_irq in irqs:
+        return "network", "woken by IRQ %d (%s)" % (wake_irq, irqs[wake_irq])
     return "other", "no network wake seen"
 
 
-def detect(before, net=NET_CLASS, path=STATE_FILE):
-    return decide(before, wakeup_counts(net), read_state(path), network_cards(net))
-
-
-def main(argv):
-    """Hook entry point: lgtv-daemon-wake pre|post [suspend|hibernate|...]. Never blocks sleep."""
-    try:
-        if len(argv) > 1:
-            hook(argv[1])
-    except Exception as e:   # noqa: BLE001 - a broken hook must never stop the PC sleeping
-        print("lgtv-daemon-wake: %s" % e, file=sys.stderr)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+def detect(before, net=NET_CLASS, wakeup=WAKEUP_CLASS, irq_file=WAKEUP_IRQ, path=WAKE_SOURCE_FILE):
+    return decide(before, wakeup_counts(net, wakeup), _int(irq_file), card_irqs(net), read_wake_source(path))

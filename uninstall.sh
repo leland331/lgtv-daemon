@@ -10,11 +10,6 @@ rm -f "$HOME/.config/systemd/user/lgtv-daemon.service" "$HOME/.local/bin/lgtv-da
       "$HOME/.config/autostart/lgtv-daemon.desktop"
 rm -rf "$HOME/.local/share/lgtv-daemon"
 command -v systemctl >/dev/null && systemctl --user daemon-reload
-if [ -f /usr/lib/systemd/system-sleep/lgtv-daemon-wake ]; then
-    sudo rm -f /usr/lib/systemd/system-sleep/lgtv-daemon-wake /run/lgtv-daemon-wake.json
-fi
-[ -f /etc/NetworkManager/dispatcher.d/pre-down.d/90-lgtv-daemon ] && sudo rm -f /etc/NetworkManager/dispatcher.d/pre-down.d/90-lgtv-daemon
-[ -f /etc/systemd/logind.conf.d/50-lgtv-daemon.conf ] && sudo rm -f /etc/systemd/logind.conf.d/50-lgtv-daemon.conf
 if [ -f /etc/ufw/applications.d/lgtv-daemon ]; then
     sudo ufw delete allow lgtv-daemon
     sudo rm -f /etc/ufw/applications.d/lgtv-daemon

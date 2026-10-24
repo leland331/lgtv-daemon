@@ -1,7 +1,7 @@
 import json
 import os
-import struct
 import tempfile
+import time
 import unittest
 
 from lgtvc import wake
@@ -9,112 +9,90 @@ from lgtvc import wake
 NIC = "0000:06:00.0"
 
 
-def root_port_cfg(status=0, port_type=wake.PORT_ROOT):
-    """256 bytes of config space: capability list -> PCIe capability at 0x40 with Root Status."""
-    b = bytearray(256)
-    struct.pack_into("<H", b, 0x06, 0x10)          # capability list present
-    b[0x34] = 0x50
-    b[0x50], b[0x51] = 0x01, 0x40                   # power management cap, then PCIe
-    b[0x40], b[0x41] = wake.PCI_CAP_EXP, 0x00
-    struct.pack_into("<H", b, 0x42, (port_type << 4) | 2)
-    struct.pack_into("<I", b, 0x40 + wake.ROOT_STATUS, status)
-    return bytes(b)
+class SysfsTest(unittest.TestCase):
+    """A fake /sys with one network card (wakeup counter, wakeup source, MSI IRQs) and lo."""
 
-
-class ConfigSpaceTest(unittest.TestCase):
-    def test_root_status_and_requester(self):
-        off, v = wake.root_status(root_port_cfg(wake.PME_STATUS | 0x0600))
-        self.assertEqual(off, 0x60)
-        self.assertTrue(v & wake.PME_STATUS)
-        self.assertEqual(wake.requester("0000:00:01.2", v), NIC)
-        self.assertEqual(wake.requester("0000:00:08.1", 0x0C03), "0000:0c:00.3")
-
-    def test_not_a_root_port(self):
-        self.assertIsNone(wake.root_status(root_port_cfg(port_type=0)))   # endpoint
-        self.assertIsNone(wake.root_status(bytes(256)))                   # no capability list
-        self.assertIsNone(wake.root_status(b""))
-
-
-class HookTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.pci = os.path.join(self.tmp.name, "devices")
-        self.state = os.path.join(self.tmp.name, "wake.json")
-        for addr, cfg in (("0000:00:01.2", root_port_cfg(wake.PME_STATUS | 0x0600)),
-                          ("0000:00:08.1", root_port_cfg(0)), (NIC, root_port_cfg(port_type=0))):
-            os.makedirs(os.path.join(self.pci, addr))
-            with open(os.path.join(self.pci, addr, "config"), "wb") as f:
-                f.write(cfg)
+        d = self.tmp.name
+        self.dev = os.path.join(d, "devices", "pci0000:00", NIC)
+        os.makedirs(os.path.join(self.dev, "power"))
+        os.makedirs(os.path.join(self.dev, "msi_irqs", "41"))
+        self.write(os.path.join(self.dev, "power", "wakeup_count"), "3")
+        self.write(os.path.join(self.dev, "irq"), "0")
+        self.net = os.path.join(d, "net")
+        os.makedirs(os.path.join(self.net, "enp6s0"))
+        os.symlink(self.dev, os.path.join(self.net, "enp6s0", "device"))
+        os.makedirs(os.path.join(self.net, "lo"))                    # virtual: no device link
+        self.wakeup = os.path.join(d, "wakeup")
+        for ws, owner, n in (("wakeup5", self.dev, "7"), ("wakeup6", os.path.join(d, "devices", "usb1"), "9")):
+            os.makedirs(os.path.join(self.wakeup, ws))
+            os.makedirs(owner, exist_ok=True)
+            os.symlink(owner, os.path.join(self.wakeup, ws, "device"))
+            self.write(os.path.join(self.wakeup, ws, "wakeup_count"), n)
+        self.irq = os.path.join(d, "pm_wakeup_irq")
+        self.hook = os.path.join(d, "wake.json")
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_post_records_requester(self):
-        wake.hook("post", self.pci, self.state, wait=0)
-        st = json.load(open(self.state))
-        self.assertEqual(st["phase"], "post")
-        self.assertEqual(st["pme"], [{"port": "0000:00:01.2", "requester": NIC}])
+    @staticmethod
+    def write(path, text):
+        with open(path, "w") as f:
+            f.write(text + "\n")
 
-    def test_pre_clears_latched_status(self):
-        wake.hook("pre", self.pci, self.state)
-        with open(os.path.join(self.pci, "0000:00:01.2", "config"), "rb") as f:
-            cfg = f.read()
-        # a real register clears on writing 1; the fake file just holds what was written
-        self.assertEqual(struct.unpack_from("<I", cfg, 0x60)[0], wake.PME_STATUS)
-        with open(os.path.join(self.pci, "0000:00:08.1", "config"), "rb") as f:
-            self.assertEqual(struct.unpack_from("<I", f.read(), 0x60)[0], 0)   # untouched
-        self.assertEqual(json.load(open(self.state))["phase"], "pre")
+    def detect(self, before):
+        return wake.detect(before, self.net, self.wakeup, self.irq, self.hook)
 
-    def test_main_never_raises(self):
-        self.assertEqual(wake.main(["hook", "post"]), 0)   # real paths, likely not writable here
+    def test_cards_counts_irqs(self):
+        self.assertEqual(wake.network_cards(self.net), {"enp6s0": os.path.realpath(self.dev)})
+        self.assertEqual(wake.wakeup_counts(self.net, self.wakeup), {"enp6s0": 3, "enp6s0/wakeup5": 7})
+        self.assertEqual(wake.card_irqs(self.net), {41: "enp6s0"})
 
+    def test_counter_went_up(self):
+        before = wake.snapshot(self.net, self.wakeup)
+        self.write(os.path.join(self.wakeup, "wakeup5", "wakeup_count"), "8")
+        self.assertEqual(self.detect(before)[0], "network")
 
-class NetTest(unittest.TestCase):
-    def test_cards_and_counts(self):
-        with tempfile.TemporaryDirectory() as d:
-            dev = os.path.join(d, "pci0000:00", NIC)
-            os.makedirs(os.path.join(dev, "power"))
-            with open(os.path.join(dev, "power", "wakeup_count"), "w") as f:
-                f.write("3\n")
-            net = os.path.join(d, "net")
-            os.makedirs(os.path.join(net, "enp6s0"))
-            os.symlink(dev, os.path.join(net, "enp6s0", "device"))
-            os.makedirs(os.path.join(net, "lo"))                 # virtual: no device link
-            self.assertEqual(wake.network_cards(net), {NIC: "enp6s0"})
-            self.assertEqual(wake.wakeup_counts(net), {"enp6s0": 3})
+    def test_nothing_moved(self):
+        before = wake.snapshot(self.net, self.wakeup)
+        self.write(os.path.join(self.wakeup, "wakeup6", "wakeup_count"), "10")   # USB keyboard, not the NIC
+        self.assertEqual(self.detect(before), ("other", "no network wake seen"))
+
+    def test_wakeup_irq(self):
+        before = wake.snapshot(self.net, self.wakeup)
+        self.write(self.irq, "41")
+        self.assertEqual(self.detect(before), ("network", "woken by IRQ 41 (enp6s0)"))
+        self.write(self.irq, "9")
+        self.assertEqual(self.detect(before)[0], "other")
+
+    def test_wake_source_file(self):
+        before = wake.snapshot(self.net, self.wakeup)
+        with open(self.hook, "w") as f:
+            json.dump({"time": time.time() + 1, "source": "network", "detail": "root port PME"}, f)
+        self.assertEqual(self.detect(before), ("network", "wake-source file: root port PME"))
+        with open(self.hook, "w") as f:                                  # older than the sleep: ignored
+            json.dump({"time": before["time"] - 10, "source": "network"}, f)
+        self.assertEqual(self.detect(before)[0], "other")
+        with open(self.hook, "w") as f:
+            f.write("not json")
+        self.assertEqual(self.detect(before)[0], "other")
 
 
 class DecideTest(unittest.TestCase):
-    cards = {NIC: "enp6s0"}
     before = {"time": 100.0, "counts": {"enp6s0": 0}}
 
-    def post(self, *requesters, t=200.0):
-        return {"phase": "post", "time": t, "pme": [{"port": "0000:00:01.2", "requester": r} for r in requesters]}
+    def test_file_says_other_beats_counters(self):
+        hook = {"time": 200.0, "source": "other", "detail": "power button"}
+        self.assertEqual(wake.decide(self.before, {"enp6s0": 1}, None, {}, hook)[0], "other")
 
-    def test_pme_from_network_card(self):
-        src, why = wake.decide(self.before, {"enp6s0": 0}, self.post(NIC), self.cards)
-        self.assertEqual(src, "network")
-        self.assertIn("enp6s0", why)
-
-    def test_pme_from_usb_is_other(self):
-        src, why = wake.decide(self.before, {"enp6s0": 0}, self.post("0000:0c:00.3"), self.cards)
-        self.assertEqual((src, why), ("other", "woken by 0000:0c:00.3"))
-
-    def test_power_button_nothing_latched(self):
-        self.assertEqual(wake.decide(self.before, {"enp6s0": 0}, self.post(), self.cards)[0], "other")
-
-    def test_stale_hook_state_ignored(self):
-        src, why = wake.decide(self.before, {"enp6s0": 0}, self.post(NIC, t=50.0), self.cards)
-        self.assertEqual(src, "other")
-        self.assertIn("not installed", why)
-
-    def test_counter_fallback(self):
-        src, why = wake.decide(self.before, {"enp6s0": 1}, None, self.cards)
+    def test_counter(self):
+        src, why = wake.decide(self.before, {"enp6s0": 1}, None, {}, None)
         self.assertEqual(src, "network")
         self.assertIn("0 to 1", why)
 
-    def test_no_snapshot_no_hook(self):
-        self.assertEqual(wake.decide(None, {"enp6s0": 5}, None, self.cards)[0], "other")
+    def test_no_snapshot(self):
+        self.assertEqual(wake.decide(None, {"enp6s0": 5}, None, {}, {"time": 5, "source": "network"})[0], "other")
 
 
 class FakeDaemon:

@@ -93,41 +93,47 @@ Settings are stored in `~/.config/lgtv-daemon/config.json`, the log in
 
 ## Network wake
 
-To tell a network wake from any other, `install.sh` adds a small root hook,
-`/usr/lib/systemd/system-sleep/lgtv-daemon-wake` (it is `lgtvc/wake.py`). Before suspend it clears
-the PCIe root ports' "PME Status"; after resume it records which device sent the wake message
-in `/run/lgtv-daemon-wake.json`. If that device is a network card, the daemon skips the resume
-power-on and waits for the first keyboard or mouse input. Where the kernel itself counts the
-wake (the network card's `power/wakeup_count` goes up), that is used too. The log says which
-path was taken (`wake source: network (...)` or `wake source: other (...)`).
+After a resume the daemon checks what woke the PC, using only what the kernel shows to ordinary
+users: the network card's wakeup counter (`/sys/class/net/<if>/device/power/wakeup_count`), the
+kernel's wakeup sources that belong to a network card (`/sys/class/wakeup/`), and the interrupt
+that woke the system (`/sys/power/pm_wakeup_irq`). If the network card woke it, the daemon skips
+the resume power-on and waits for the first keyboard or mouse input. The log says what it found
+(`wake source: network (...)` or `wake source: other (...)`).
 
-Anything unclear counts as an ordinary wake, so without the hook, or on hardware where neither
-signal is available, the TV turns on at resume as before. Wake-on-LAN itself must be enabled on
-the network card (`ethtool -s <interface> wol g`) and in the firmware; this feature only decides
-what the TV does afterwards.
+Anything unclear counts as an ordinary wake, so the TV turns on at resume as before. Wake-on-LAN
+itself must be enabled on the network card (`ethtool -s <interface> wol g`) and in the firmware;
+this feature only decides what the TV does afterwards.
+
+**Machines that don't record network wakes.** On some boards the firmware handles the wake and
+none of the counters above move. There you can supply the answer yourself: any root hook (for
+example a script in `/usr/lib/systemd/system-sleep/`) can write `/run/lgtv-daemon-wake.json`
+after each resume:
+
+```json
+{"time": 1700000000.0, "source": "network", "detail": "how it was detected"}
+```
+
+`time` is when the file was written (Unix time); `source` is `network` or `other`. The daemon uses
+the file only if it was written after the sleep began, and otherwise falls back to the counters.
 
 ## Sleep and shutdown
 
-The PC gives programs only a few seconds before it sleeps, and NetworkManager disconnects the
-network almost at once (within a few hundredths of a second), so connecting to the TV at that
-moment often fails. Three things make the power-off reliable:
+The PC gives programs only a few seconds before it sleeps, and the network may be disconnected
+almost at once, so connecting to the TV at that moment can fail. The daemon keeps a **persistent
+connection** to each paired TV (on by default; "Persistent connection", config key
+`persistent_connection`) and follows its power state, reconnecting in the background (1 s, growing
+to 20 s between tries) and sending a small keepalive every 20 s. At sleep the power-off goes out
+over it straight away. If it is down, the daemon makes quick connection attempts within the time
+logind allows (`InhibitDelayMaxSec`, 5 s by default; the daemon reads the actual value) and holds
+sleep only until the TV has been told to turn off.
 
-- **Persistent connection** (on by default; "Persistent connection", config key
-  `persistent_connection`). The daemon keeps a connection open to each paired TV and follows its
-  power state, reconnecting in the background (1 s, growing to 20 s between tries) and sending a
-  small keepalive every 20 s. At sleep the power-off goes out over it straight away. If it is down,
-  the daemon makes up to three quick connection attempts (1.5 s each) within the time logind allows.
-- **NetworkManager hook.** `install.sh` adds
-  `/etc/NetworkManager/dispatcher.d/pre-down.d/90-lgtv-daemon`. NetworkManager runs it, and waits
-  for it, before taking an interface down; when it is going to sleep, the hook asks the daemon to
-  turn the TVs off first. At any other time it does nothing.
-- **Longer delay window.** logind lets programs hold sleep and shutdown for 5 s by default.
-  `install.sh` raises this to 15 s with `/etc/systemd/logind.conf.d/50-lgtv-daemon.conf`, unless
-  `InhibitDelayMaxSec` is already set somewhere else. **It takes effect after the next reboot**:
-  logind can't reload it without restarting, and restarting logind logs you out. The daemon holds
-  sleep only until the TV has been told to turn off (usually a few milliseconds).
+Hooks that run before the network goes down can ask for the power-off early by sending the line
+`prepare_sleep` to the daemon's socket, `$XDG_RUNTIME_DIR/lgtv-daemon.sock`. It is done once per
+sleep, however many times it is asked.
 
-`uninstall.sh` removes the hook and the logind file.
+**Restarting the daemon** (an update, `systemctl --user restart lgtv-daemon`) does not turn the TV
+on. The daemon powers the TV on at start only at boot or login, or if the keyboard or mouse was
+used in the last two minutes.
 
 **Turned off at the TV.** If you switch the TV off with its remote or button while the PC is on,
 the daemon leaves it off (display, lock-screen and idle events included) until your next keyboard

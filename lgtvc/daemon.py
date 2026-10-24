@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
 
 from gi.repository import GLib
 
-from . import commands, config, idle, persist, topology, wake, webos
+from . import commands, config, idle, persist, startup, topology, wake, webos
 from .keepawake import KeepAwake
 from .tray import Tray
 
@@ -192,7 +192,7 @@ class Daemon:
     def power_off_before(self, deadline, why):
         """Power the managed TVs off before the inhibitor window closes (sleep, shutdown).
         Uses the persistent connection when it is up (sent within milliseconds, before the network
-        goes down), else quick retries. Runs once per sleep even if both the NetworkManager hook and
+        goes down), else quick retries. Runs once per sleep even if both a pre-sleep hook (prepare_sleep) and
         logind ask. Returns when done or at the deadline."""
         with self.sleep_lock:
             if time.time() - self.sleep_off_at < 30:
@@ -565,7 +565,7 @@ class Daemon:
                 line = line.strip()
                 if not line:
                     continue
-                if line == "prepare_sleep":    # NetworkManager pre-down hook: network is about to go
+                if line == "prepare_sleep":    # for system hooks: the network is about to go down
                     res = {"result": self.power_off_before(time.time() + 4, "sleep (network going down)")}
                 elif line == "reload":
                     GLib.idle_add(self.reload)
@@ -589,6 +589,17 @@ class Daemon:
                     self.clients.remove(c)
             c.close()
 
+    def power_on_at_start(self, check=startup.check):
+        """Boot/login (or recent input): power on, unless topology says the TV's output is off.
+        A plain service restart leaves the TV as it is."""
+        try:
+            on, why = check()
+        except Exception as e:
+            on, why = True, "could not tell (%s)" % e
+        self.log("start: %s" % why)
+        if on:
+            self.each("on", [d for d in self.managed() if self.cfg["topology"]["keep_on_boot"] or self.topo_ok(d)])
+
     # ------------------------------------------------------------ main
     def run(self):
         loop = GLib.MainLoop()
@@ -602,9 +613,7 @@ class Daemon:
         self.serve()
         self.start_idle()
         self.apply_tray()
-        # boot/login: power on (unless topology says the TV's output is off)
-        boot = [d for d in self.managed() if self.cfg["topology"]["keep_on_boot"] or self.topo_ok(d)]
-        self.each("on", boot)
+        self.power_on_at_start()
         self.sync_persistent()
         GLib.timeout_add_seconds(2, self.poll_topology)
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGHUP, self.reload)

@@ -34,8 +34,8 @@ DEFAULTS = {
     "tray": True,                 # show the tray icon
     "power_on_timeout": 40,
     "blank_instead_of_poweroff": False,
-    "stay_off_on_network_wake": True,
-    "persistent_connection": True,     # keep a connection open to each TV (fast power off at sleep)  # Wake-on-LAN wake: TV stays off until keyboard/mouse input
+    "stay_off_on_network_wake": True,  # after a Wake-on-LAN wake the TV stays off until keyboard/mouse input
+    "persistent_connection": True,     # keep a connection open to each TV (fast power off at sleep)
     "idle": {
         "enabled": False,
         "minutes": 10,
