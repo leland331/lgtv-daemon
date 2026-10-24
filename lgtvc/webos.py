@@ -119,12 +119,15 @@ def connect(dev, timeout=5.0, pair_timeout=60.0, on_prompt=None):
     return tv
 
 
-def power_on(dev, timeout=40, log=print, connect_fn=None):
+def power_on(dev, timeout=40, log=print, connect_fn=None, cancel=None):
     """WOL until the TV answers, then turn the screen on if it is only blanked; then optionally
     switch to the PC's HDMI input after the configured delay (LGTV Companion behaviour)."""
     connect_fn = connect_fn or (lambda d: connect(d, timeout=3, pair_timeout=10))
     end = time.time() + timeout
     while time.time() < end:
+        if cancel and cancel():          # e.g. turned off at the TV meanwhile: stop sending wakes
+            log("%s: power on cancelled" % dev["name"])
+            return False
         wol.wake(dev)
         try:
             tv = connect_fn(dev)

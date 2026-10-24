@@ -14,6 +14,10 @@
   delay window. A NetworkManager pre-down hook asks the daemon to turn the TV off before the
   network goes down, and `install.sh` raises logind's `InhibitDelayMaxSec` to 15 s (after the next
   reboot) unless it is set elsewhere.
+- If you turn the TV off at the TV or with its remote while the PC is on (also at the lock screen),
+  it stays off until your next keyboard or mouse input; the daemon no longer turns it straight back
+  on. Detected over the persistent connection. Power-on requests are also no longer queued up
+  (one at a time per TV), and a running power-on stops sending Wake-on-LAN once the TV is turned off.
 
 ## 0.1.0
 

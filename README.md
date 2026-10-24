@@ -129,6 +129,10 @@ moment often fails. Three things make the power-off reliable:
 
 `uninstall.sh` removes the hook and the logind file.
 
+**Turned off at the TV.** If you switch the TV off with its remote or button while the PC is on,
+the daemon leaves it off (display, lock-screen and idle events included) until your next keyboard
+or mouse input, then turns it back on. This needs the persistent connection.
+
 ## Development
 
 The code is in `lgtvc/`. Run the tests with `python3 -m unittest discover -s tests`, and

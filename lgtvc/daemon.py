@@ -34,6 +34,10 @@ class Daemon:
         self.persist = {}             # device name -> persist.Persistent
         self.sleep_lock = threading.Lock()
         self.sleep_off_at = 0.0       # when the TVs were last powered off for sleep/shutdown
+        self.user_off = set()         # TVs turned off at the TV/remote: stay off until fresh input
+        self.own_off_at = {}          # device name -> when the daemon itself last turned it off/blank
+        self.on_busy = set()          # devices with a power on queued or running (debounce)
+        self.resumed_at = 0.0
         self.topo = {}
         self.dpms = {}
         self.idle_backend = None
@@ -88,7 +92,16 @@ class Daemon:
         devices = self.managed() if devices is None else devices
         futs = []
         for d in devices:
+            if action in ("on", "unblank"):
+                if d["name"] in self.user_off:
+                    self.log("%s: stays off (turned off at the TV) until keyboard or mouse input" % d["name"])
+                    continue
+                if action == "on" and d["name"] in self.on_busy:
+                    continue                  # a power on is already queued or running
+            if action in ("off", "off_forced", "blank"):
+                self.own_off_at[d["name"]] = time.time()
             if action == "on":
+                self.on_busy.add(d["name"])
                 f = (self._power_on, d)
             elif action == "off":
                 f = (webos.power_off, d, self.cfg["blank_instead_of_poweroff"], self.log)
@@ -108,7 +121,11 @@ class Daemon:
                 f.result()
 
     def _power_on(self, d):
-        ok = webos.power_on(d, self.cfg["power_on_timeout"], self.log)
+        try:
+            ok = webos.power_on(d, self.cfg["power_on_timeout"], self.log,
+                                cancel=lambda: d["name"] in self.user_off)
+        finally:
+            self.on_busy.discard(d["name"])
         p = self.persist.get(d["name"])
         if ok and p and not p.alive():
             p.kick()
@@ -125,7 +142,52 @@ class Daemon:
                 del self.persist[name]
         for name, d in want.items():
             if name not in self.persist:
-                self.persist[name] = persist.Persistent(d, self.log).start()
+                self.persist[name] = persist.Persistent(d, self.log, on_change=self.tv_state_changed).start()
+
+    # ------------------------------------------------------------ turned off at the TV
+    def is_external_off(self, name, old, new, now=None):
+        """True if a state change means someone turned the TV off at the TV or remote, not us."""
+        now = time.time() if now is None else now
+        if old not in ("Active", "Screen Off") or new not in ("Active Standby", "Suspend", "Power Off", ""):
+            return False
+        if new == "" and old != "Active":
+            return False                  # lost connection while blanked: not a clear signal
+        recent = max(self.own_off_at.get(name, 0), self.sleep_off_at, self.resumed_at)
+        return now - recent > 15
+
+    def tv_state_changed(self, name, old, new):
+        """From a persistent connection's thread."""
+        if self.is_external_off(name, old, new):
+            GLib.idle_add(self.mark_user_off, name)
+        elif new == "Active" and name in self.user_off:
+            GLib.idle_add(self.clear_user_off, name)
+
+    def mark_user_off(self, name):
+        if name not in self.user_off:
+            self.user_off.add(name)
+            self.log("%s: turned off at the TV; stays off until keyboard or mouse input" % name)
+            self.watch_input(self.on_input_after_user_off)
+        return False
+
+    def clear_user_off(self, name):
+        if name in self.user_off:
+            self.user_off.discard(name)
+            self.log("%s: turned on at the TV" % name)
+        return False
+
+    def on_input_after_user_off(self):
+        self.stop_input_watch()
+        self.end_network_wake()
+        if self.user_off:
+            self.log("input after the TV was turned off: powering the TV on")
+            self.user_off.clear()
+            self.each("on", [d for d in self.managed() if self.topo_ok(d)])
+
+    def manual_on(self):
+        """Tray Turn TV On: an explicit request beats 'turned off at the TV'."""
+        self.user_off.clear()
+        self.end_network_wake()
+        self.each("on")
 
     def power_off_before(self, deadline, why):
         """Power the managed TVs off before the inhibitor window closes (sleep, shutdown).
@@ -213,6 +275,8 @@ class Daemon:
         self.event("SYSTEM_RESUME")
         self.user_idle = False
         self.sleep_off_at = 0.0
+        self.resumed_at = time.time()
+        self.user_off.clear()             # a new wake starts fresh
         for p in self.persist.values():
             p.kick()                      # the old sockets died with the network during sleep
         if self.cfg["stay_off_on_network_wake"]:
@@ -308,6 +372,7 @@ class Daemon:
     def on_input_after_off(self):
         self.stop_input_watch()
         self.end_network_wake()
+        self.user_off.clear()
         self.each("on")
 
     def stop_input_watch(self):
@@ -320,6 +385,12 @@ class Daemon:
 
     def on_active(self):
         self.stop_input_watch()
+        if self.user_off:                 # first input after the TV was turned off at the TV
+            if self.user_idle:
+                self.user_idle = False
+                self.event("SYSTEM_USER_BUSY")
+            self.on_input_after_user_off()
+            return
         if self.network_woken:            # first input after a Wake-on-LAN wake: power on, not unblank
             if self.user_idle:
                 self.user_idle = False

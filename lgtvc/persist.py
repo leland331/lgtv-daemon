@@ -19,9 +19,10 @@ SUB_APP = "sub_app"
 
 
 class Persistent:
-    def __init__(self, dev, log=print, connect_fn=None):
+    def __init__(self, dev, log=print, connect_fn=None, on_change=None):
         self.dev = dict(dev)
         self.log = log
+        self.on_change = on_change   # on_change(name, old_state, new_state); "" = connection lost
         self.connect_fn = connect_fn or (lambda d: webos.connect(d, timeout=3, pair_timeout=5))
         self.tv = None
         self.state = ""            # cached power state from the subscription
@@ -83,6 +84,7 @@ class Persistent:
                 if not self._stop.is_set() and not self._kick.is_set():
                     self.log("%s: persistent connection lost (%s)" % (self.dev["name"], e))
                     fails = 1
+                    self._changed(self.state, "")
             finally:
                 self._drop()
             if self._kick.is_set():
@@ -141,7 +143,8 @@ class Persistent:
         pl = msg.get("payload") or {}
         if rid == SUB_POWER:
             if "state" in pl:
-                self.state = pl["state"]
+                old, self.state = self.state, pl["state"]
+                self._changed(old, self.state)
         elif rid == SUB_APP:
             if "appId" in pl:
                 self.app = pl["appId"]
@@ -151,6 +154,13 @@ class Persistent:
             if box is not None:
                 box["msg"] = msg
                 box["ev"].set()
+
+    def _changed(self, old, new):
+        if self.on_change and old != new:
+            try:
+                self.on_change(self.dev["name"], old, new)
+            except Exception as e:
+                self.log("%s: state callback failed: %s" % (self.dev["name"], e))
 
     def request(self, uri, payload=None, wait=True, timeout=5.0):
         if not uri.startswith(("ssap://", "luna://")):
