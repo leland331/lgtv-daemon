@@ -30,13 +30,16 @@ def system_jobs(bus):
 
 
 class Power:
-    """Calls on_sleep(), on_resume(), on_shutdown(reboot: bool) from the GLib main loop."""
+    """Calls on_sleep(window), on_resume(), on_shutdown(reboot: bool, window) from the GLib main loop.
+    window is logind's InhibitDelayMaxSec: how long our delay inhibitor may hold sleep/shutdown.
+    The inhibitor is released when the callback returns."""
 
     def __init__(self, on_sleep, on_resume, on_shutdown, log=print):
         self.on_sleep, self.on_resume, self.on_shutdown, self.log = on_sleep, on_resume, on_shutdown, log
         self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
         self.fds = {}
         self.has_metadata = False
+        self.delay = self.window()        # read now: no extra D-Bus round trip once sleep starts
         for what in ("sleep", "shutdown"):
             self._inhibit(what)
         self.bus.signal_subscribe(LOGIN1[0], LOGIN1[2], None, LOGIN1[1], None, Gio.DBusSignalFlags.NONE, self._signal)
@@ -53,6 +56,15 @@ class Power:
         except GLib.Error as e:
             self.log("inhibit %s failed: %s" % (what, e.message))
 
+    def window(self):
+        try:
+            r = self.bus.call_sync(LOGIN1[0], LOGIN1[1], "org.freedesktop.DBus.Properties", "Get",
+                                   GLib.Variant("(ss)", (LOGIN1[2], "InhibitDelayMaxUSec")), None,
+                                   Gio.DBusCallFlags.NONE, 500, None).unpack()[0]
+            return max(1.0, r / 1e6)
+        except GLib.Error:
+            return 5.0
+
     def _release(self, what):
         fd = self.fds.pop(what, None)
         if fd is not None:
@@ -61,10 +73,11 @@ class Power:
     def _signal(self, conn, sender, path, iface, name, params):
         if name == "PrepareForSleep":
             if params.unpack()[0]:
-                self.on_sleep()
+                self.on_sleep(self.delay)
                 self._release("sleep")
             else:
                 self._inhibit("sleep")
+                self.delay = self.window()
                 self.on_resume()
         elif name in ("PrepareForShutdown", "PrepareForShutdownWithMetadata"):
             args = params.unpack()
@@ -92,5 +105,5 @@ class Power:
     def _do_shutdown(self, reboot):
         if "shutdown" not in self.fds:
             return
-        self.on_shutdown(reboot)
+        self.on_shutdown(reboot, self.delay)
         self._release("shutdown")

@@ -4,6 +4,7 @@ import os
 import socket
 import ssl
 import struct
+import time
 from urllib.parse import urlparse
 
 
@@ -34,6 +35,8 @@ class WebSocket:
                 raise WSError("connection closed during handshake")
             buf += chunk
         head, self._buf = buf.split(b"\r\n\r\n", 1)
+        self._taken = []
+        self.last_rx = time.time()
         if b" 101 " not in head.split(b"\r\n")[0]:
             raise WSError("handshake failed: %r" % head[:80])
 
@@ -59,12 +62,26 @@ class WebSocket:
                 raise WSError("connection closed")
             self._buf += chunk
         out, self._buf = self._buf[:n], self._buf[n:]
+        self._taken.append(out)
         return out
 
     def recv(self):
+        """Next text message. A timeout leaves the stream intact, so recv can simply be called again."""
+        self._taken = []
+        try:
+            return self._recv()
+        except TimeoutError:
+            self._buf = b"".join(self._taken) + self._buf
+            raise
+
+    def ping(self):
+        self.sock.sendall(b"\x89\x80" + os.urandom(4))
+
+    def _recv(self):
         msg = b""
         while True:
             b1, b2 = self._read(2)
+            self.last_rx = time.time()
             op, n = b1 & 0x0F, b2 & 0x7F
             if n == 126:
                 n = struct.unpack("!H", self._read(2))[0]

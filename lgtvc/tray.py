@@ -68,7 +68,7 @@ class Tray:
         self.items = [   # (id, label, action)  action None = separator
             (1, "Open LGTV Daemon", self.d.open_gui), (2, None, None),
             (3, "Keep Screen On", self.d.toggle_keep_awake), (4, None, None),
-            (5, "Turn TV On", lambda: self.d.each("on")), (6, "Turn TV Off", lambda: self.d.manual_off()),
+            (5, "Turn TV On", lambda: self.d.manual_on()), (6, "Turn TV Off", lambda: self.d.manual_off()),
             (7, "Blank Screen", lambda: self.d.on_idle(forced=True)), (8, None, None),
             (9, "Quit Tray", self.d.quit_tray)]
 

@@ -321,6 +321,12 @@ class Window(Adw.ApplicationWindow):
                          top("blank_instead_of_poweroff")))
         g.add(spin_row("Power on timeout (seconds)", "How long to keep trying to wake the TV.",
                        c["power_on_timeout"], 5, 120, top("power_on_timeout")))
+        g.add(switch_row("Keep TV off after a network wake", "When the PC is woken over the network "
+                         "(Wake-on-LAN), leave the TV off until you use the keyboard or mouse.",
+                         c["stay_off_on_network_wake"], top("stay_off_on_network_wake")))
+        g.add(switch_row("Persistent connection", "Keep a connection open to each TV so it can be turned "
+                         "off instantly when the PC sleeps or shuts down.",
+                         c["persistent_connection"], top("persistent_connection")))
         page.add(g)
 
         g = Adw.PreferencesGroup(title="User idle mode", description="Blank the TV screen when you've been away "

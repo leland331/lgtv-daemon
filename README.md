@@ -9,7 +9,12 @@ Persson. It aims to match its features and settings, and the command line is com
 ## Features
 
 - TV turns off at shutdown and before sleep, and back on at boot and after resume. Reboots are
-  left alone.
+  left alone. A persistent connection to each TV (like LGTV Companion's) makes the power-off at
+  sleep instant; see [Sleep and shutdown](#sleep-and-shutdown).
+- Wake-on-LAN aware: if the PC was woken over the network (for example a remote job), the TV
+  stays off until you touch the keyboard or mouse. Woken by keyboard, mouse or power button, it
+  turns on as usual. On by default ("Keep TV off after a network wake"; config key
+  `stay_off_on_network_wake`). See [Network wake](#network-wake).
 - Idle blanking: blank the screen after a set time without input and bring it back on the next
   input. Paused while video is playing or while chosen programs run.
 - Follows your display setup: if the TV's output is disabled or unplugged, the TV turns off.
@@ -85,6 +90,54 @@ as unavailable in the settings rather than failing.
 
 Settings are stored in `~/.config/lgtv-daemon/config.json`, the log in
 `~/.local/state/lgtv-daemon/log.txt`.
+
+## Network wake
+
+After a resume the daemon checks what woke the PC, using only what the kernel shows to ordinary
+users: the network card's wakeup counter (`/sys/class/net/<if>/device/power/wakeup_count`), the
+kernel's wakeup sources that belong to a network card (`/sys/class/wakeup/`), and the interrupt
+that woke the system (`/sys/power/pm_wakeup_irq`). If the network card woke it, the daemon skips
+the resume power-on and waits for the first keyboard or mouse input. The log says what it found
+(`wake source: network (...)` or `wake source: other (...)`).
+
+Anything unclear counts as an ordinary wake, so the TV turns on at resume as before. Wake-on-LAN
+itself must be enabled on the network card (`ethtool -s <interface> wol g`) and in the firmware;
+this feature only decides what the TV does afterwards.
+
+**Machines that don't record network wakes.** On some boards the firmware handles the wake and
+none of the counters above move. There you can supply the answer yourself: any root hook (for
+example a script in `/usr/lib/systemd/system-sleep/`) can write `/run/lgtv-daemon-wake.json`
+after each resume:
+
+```json
+{"time": 1700000000.0, "source": "network", "detail": "how it was detected"}
+```
+
+`time` is when the file was written (Unix time); `source` is `network` or `other`. The daemon uses
+the file only if it was written after the sleep began, and otherwise falls back to the counters.
+
+## Sleep and shutdown
+
+The PC gives programs only a few seconds before it sleeps, and the network may be disconnected
+almost at once, so connecting to the TV at that moment can fail. The daemon keeps a **persistent
+connection** to each paired TV (on by default; "Persistent connection", config key
+`persistent_connection`) and follows its power state, reconnecting in the background (1 s, growing
+to 20 s between tries) and sending a small keepalive every 20 s. At sleep the power-off goes out
+over it straight away. If it is down, the daemon makes quick connection attempts within the time
+logind allows (`InhibitDelayMaxSec`, 5 s by default; the daemon reads the actual value) and holds
+sleep only until the TV has been told to turn off.
+
+Hooks that run before the network goes down can ask for the power-off early by sending the line
+`prepare_sleep` to the daemon's socket, `$XDG_RUNTIME_DIR/lgtv-daemon.sock`. It is done once per
+sleep, however many times it is asked.
+
+**Restarting the daemon** (an update, `systemctl --user restart lgtv-daemon`) does not turn the TV
+on. The daemon powers the TV on at start only at boot or login, or if the keyboard or mouse was
+used in the last two minutes.
+
+**Turned off at the TV.** If you switch the TV off with its remote or button while the PC is on,
+the daemon leaves it off (display, lock-screen and idle events included) until your next keyboard
+or mouse input, then turns it back on. This needs the persistent connection.
 
 ## Development
 
