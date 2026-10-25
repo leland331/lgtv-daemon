@@ -10,6 +10,7 @@ import time
 FRESH_SESSION_S = 180      # a login session younger than this counts as "just logged in"
 RECENT_INPUT_S = 120       # keyboard/mouse input this recent counts as "someone is here"
 MARKER = "lgtv-daemon.started"
+GRAPHICAL = ("x11", "wayland", "mir")
 
 
 def boot_id():
@@ -41,7 +42,8 @@ def first_start(path, bid):
 
 
 def session_age(now=None):
-    """Seconds since this user's newest logind session started, or None if unknown."""
+    """Seconds since this user's newest desktop (x11/wayland) logind session started, or None if
+    unknown. SSH and other text sessions don't count: an SSH login isn't someone at the TV."""
     try:
         from gi.repository import Gio, GLib
         bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
@@ -51,7 +53,8 @@ def session_age(now=None):
                                  GLib.Variant("(ss)", (iface, prop)), None, Gio.DBusCallFlags.NONE,
                                  1000, None).unpack()[0]
         sessions = get("/org/freedesktop/login1/user/self", "org.freedesktop.login1.User", "Sessions")
-        started = [get(p, "org.freedesktop.login1.Session", "Timestamp") for _, p in sessions]
+        s = "org.freedesktop.login1.Session"
+        started = [get(p, s, "Timestamp") for _, p in sessions if get(p, s, "Type") in GRAPHICAL]
         started = [t for t in started if t]
         if not started:
             return None
