@@ -166,6 +166,22 @@ class DaemonFlowTest(unittest.TestCase):
         d.watch[1]()
         self.assertEqual(d.calls, ["SYSTEM_RESUME", "on"])
 
+    def test_network_wake_cancels_early_power_on(self):
+        # Display-on arrives before the resume event: its power on must stop once the wake is known.
+        from lgtvc import daemon
+        seen = []
+        orig = daemon.webos.power_on
+        self.addCleanup(setattr, daemon.webos, "power_on", orig)
+        daemon.webos.power_on = lambda d, t, log, cancel=None: seen.append(cancel()) or False
+        d = FakeDaemon()
+        d.on_busy, d.cfg["power_on_timeout"] = set(), 1
+        d.on_resume()
+        d._power_on({"name": "LG"})
+        self.assertEqual(seen, [True])
+        d.network_woken = False           # input arrived: power on goes ahead
+        d._power_on({"name": "LG"})
+        self.assertEqual(seen, [True, False])
+
     def test_unidle_after_network_wake_powers_on(self):
         d = FakeDaemon()
         d.on_resume()

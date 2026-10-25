@@ -122,8 +122,10 @@ class Daemon:
 
     def _power_on(self, d):
         try:
+            # Also cancelled by a network wake: the desktop's display-on can arrive just before
+            # the resume event, starting a power on that the wake check then has to stop.
             ok = webos.power_on(d, self.cfg["power_on_timeout"], self.log,
-                                cancel=lambda: d["name"] in self.user_off)
+                                cancel=lambda: d["name"] in self.user_off or self.network_woken)
         finally:
             self.on_busy.discard(d["name"])
         p = self.persist.get(d["name"])
