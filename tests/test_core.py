@@ -287,6 +287,14 @@ class HdmiCheckTest(unittest.TestCase):
         self.assertTrue(webos.power_on(dev, 5, log=lambda m: None, connect_fn=lambda d: tv))
         self.assertEqual(tv.sent, ["system.launcher/launch"])
 
+    def test_power_on_leaves_other_input(self):
+        from lgtvc import webos
+        tv = FakeTV("Active", "com.webos.app.hdmi2")
+        dev = {"name": "TV", "macs": [], "wol": "ip", "ip": "127.0.0.1", "set_hdmi_input_on_power_on": True,
+               "set_hdmi_input_on_power_on_delay": 0, "source_hdmi_input": 1, "check_hdmi_input_when_power_off": True}
+        self.assertTrue(webos.power_on(dev, 5, log=lambda m: None, connect_fn=lambda d: tv))
+        self.assertNotIn("system.launcher/launch", tv.sent)
+
     def test_clamps(self):
         d = config.normalize({"devices": [{"source_hdmi_input": 9, "set_hdmi_input_on_power_on_delay": 99}]})["devices"][0]
         self.assertEqual((d["source_hdmi_input"], d["set_hdmi_input_on_power_on_delay"]), (4, 30))

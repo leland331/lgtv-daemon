@@ -121,9 +121,12 @@ def connect(dev, timeout=5.0, pair_timeout=60.0, on_prompt=None):
 
 def power_on(dev, timeout=40, log=print, connect_fn=None, cancel=None):
     """WOL until the TV answers, then turn the screen on if it is only blanked; then optionally
-    switch to the PC's HDMI input after the configured delay (LGTV Companion behaviour)."""
+    switch to the PC's HDMI input after the configured delay (LGTV Companion behaviour).
+    With check_hdmi_input_when_power_off, a TV that was already on with another input or app in
+    front is left on it."""
     connect_fn = connect_fn or (lambda d: connect(d, timeout=3, pair_timeout=10))
     end = time.time() + timeout
+    first = True
     while time.time() < end:
         if cancel and cancel():          # e.g. turned off at the TV meanwhile: stop sending wakes
             log("%s: power on cancelled" % dev["name"])
@@ -136,6 +139,7 @@ def power_on(dev, timeout=40, log=print, connect_fn=None, cancel=None):
             continue
         try:
             st = tv.power_state()
+            already_on, first = first and st == "Active", False
             if st == "Screen Off":
                 tv.request("com.webos.service.tvpower/power/turnOnScreen")
             elif st in ("Active Standby", "Suspend", "Power Off"):
@@ -143,6 +147,11 @@ def power_on(dev, timeout=40, log=print, connect_fn=None, cancel=None):
                 time.sleep(1)
                 continue
             log("%s: powered on (%s)" % (dev["name"], st or "on"))
+            if dev.get("set_hdmi_input_on_power_on") and already_on and dev.get("check_hdmi_input_when_power_off"):
+                app = tv.request("com.webos.applicationManager/getForegroundAppInfo").get("appId", "")
+                if app != HDMI_APP + str(dev.get("source_hdmi_input", 1)):
+                    log("%s: already on with %s in front; input left alone" % (dev["name"], app or "unknown"))
+                    return True
             if dev.get("set_hdmi_input_on_power_on"):
                 time.sleep(dev.get("set_hdmi_input_on_power_on_delay", 1))
                 tv.request("system.launcher/launch", {"id": "com.webos.app.hdmi%d" % dev.get("source_hdmi_input", 1)})
