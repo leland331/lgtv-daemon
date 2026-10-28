@@ -35,6 +35,7 @@ DEFAULTS = {
     "power_on_timeout": 40,
     "blank_instead_of_poweroff": False,
     "stay_off_on_network_wake": True,  # after a Wake-on-LAN wake the TV stays off until keyboard/mouse input
+    "test_mode_flags": [],             # files that switch test mode on while they exist (see README)
     "persistent_connection": True,     # keep a connection open to each TV (fast power off at sleep)
     "idle": {
         "enabled": False,
@@ -63,6 +64,10 @@ def _merge(defaults, data):
 
 def normalize(data):
     cfg = _merge(DEFAULTS, data or {})
+    flags = cfg["test_mode_flags"]
+    if isinstance(flags, str):
+        flags = [flags]
+    cfg["test_mode_flags"] = [str(f) for f in flags if isinstance(f, str) and f] if isinstance(flags, list) else []
     devs = []
     for i, d in enumerate(cfg["devices"]):
         dev = _merge(DEVICE_DEFAULTS, d)

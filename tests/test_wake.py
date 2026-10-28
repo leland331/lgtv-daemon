@@ -101,6 +101,7 @@ class FakeDaemon:
     def __init__(self, cfg_flag=True, source=("network", "test")):
         from lgtvc import daemon
         self.D = daemon.Daemon
+        self.test_mode = False
         self.cfg = {"stay_off_on_network_wake": cfg_flag, "idle": {"mute": False}, "topology": {"enabled": False},
                     "api": {"enabled": False}}
         self.network_woken = self.user_idle = False

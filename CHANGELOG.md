@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- New test mode (`test_mode_flags`, a list of file paths, empty by default). While any listed file
+  exists (and, if it holds a PID, that process is alive) the TV is kept blank but powered, input is
+  not a wake signal, and idle and display-off power-offs are skipped. When the flag goes away the
+  screen comes back with no power cycle.
 - Keep the TV off after a Wake-on-LAN wake, and power it on at the first keyboard or mouse input.
   Wakes from the keyboard, mouse or power button work as before. New option "Keep TV off after a
   network wake" (`stay_off_on_network_wake`, on by default). The wake source comes from the

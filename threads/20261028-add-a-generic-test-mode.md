@@ -5,7 +5,7 @@
 - Machine: tower
 - Agent: claude:sonnet
 - Started: 2026-10-28 00:01 CST (by `lab thread`)
-- Status: running
+- Status: done (draft PR open)
 
 ## Brief
 
@@ -18,3 +18,13 @@ Report in the handoff: the config key and an example.
 ## Where it stands
 
 (The thread keeps this current: what's done, commit SHAs, next steps, blockers.)
+
+Done: `lgtvc/testmode.py` (flag check), daemon polls every 3 s (`poll_test_mode`), gating in
+`each()`, `on_idle`, `on_active`/`on_input_after_*`, `poll_dpms`. README "Test mode", CHANGELOG,
+`tests/test_testmode.py`. Full suite: 86 tests OK.
+
+Lock-screen search: nothing in the daemon can lock the session. No `lock-session`, `loginctl`,
+`org.freedesktop.ScreenSaver.Lock`, `SetLockedHint`. ScreenSaver is used only for `Inhibit`/`UnInhibit`
+(keepawake.py) and `GetSessionIdleTime` (idle.py); logind only for sleep/shutdown inhibitors,
+`InhibitDelayMaxUSec`, and IdleHint/session property reads. Python `threading.Lock` hits are unrelated.
+Config: `"test_mode_flags": ["/run/user/1000/my-test.flag"]`.
