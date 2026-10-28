@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
 
 from gi.repository import GLib
 
-from . import commands, config, idle, persist, startup, topology, wake, webos
+from . import commands, config, idle, persist, startup, testmode, topology, wake, webos
 from .keepawake import KeepAwake
 from .tray import Tray
 
@@ -19,6 +19,8 @@ SOCKET_PATH = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "lgtv-da
 
 
 class Daemon:
+    test_mode = False             # a test_mode_flags file is on: TV blank and hands-off
+
     def __init__(self):
         self.cfg = config.load()
         self.pool = ThreadPoolExecutor(8)
@@ -28,6 +30,7 @@ class Daemon:
         self.input_watch = None       # manual blank/off: short idle watcher, wakes the TV on input
         self.session_on = set()       # -autoenable  (until restart)
         self.user_idle = False
+        self.test_blank_at = {}       # device name -> when test mode last sent a blank
         self.network_woken = False    # woken by Wake-on-LAN: TV stays off until keyboard/mouse input
         self.sleep_snapshot = None    # network-card wakeup counters taken before sleep
         self.streaming = False
@@ -90,6 +93,9 @@ class Daemon:
 
     def each(self, action, devices=None, wait=False):
         devices = self.managed() if devices is None else devices
+        if self.test_mode and action in ("on", "off", "off_forced", "unblank"):
+            self.log("test mode: ignoring %s" % action)
+            return
         futs = []
         for d in devices:
             if action in ("on", "unblank"):
@@ -178,6 +184,8 @@ class Daemon:
         return False
 
     def on_input_after_user_off(self):
+        if self.test_mode:
+            return
         self.stop_input_watch()
         self.end_network_wake()
         if self.user_off:
@@ -295,6 +303,8 @@ class Daemon:
         self.each("on", [d for d in self.managed() if self.topo_ok(d)])
 
     def on_input_after_network_wake(self):
+        if self.test_mode:
+            return
         self.stop_input_watch()
         if self.end_network_wake():
             self.log("input after network wake: powering the TV on")
@@ -334,7 +344,7 @@ class Daemon:
         return ""
 
     def on_idle(self, forced=False):
-        if self.user_idle or self.streaming:
+        if self.user_idle or self.streaming or self.test_mode:
             return
         why = "" if forced else self.idle_excluded()
         if why:
@@ -372,6 +382,8 @@ class Daemon:
         self.watch_input(self.on_input_after_off)
 
     def on_input_after_off(self):
+        if self.test_mode:
+            return
         self.stop_input_watch()
         self.end_network_wake()
         self.user_off.clear()
@@ -386,6 +398,8 @@ class Daemon:
             w.stop()
 
     def on_active(self):
+        if self.test_mode:                # input is not a wake signal in test mode
+            return
         self.stop_input_watch()
         if self.user_off:                 # first input after the TV was turned off at the TV
             if self.user_idle:
@@ -453,7 +467,7 @@ class Daemon:
         now = topology.display_on(c)
         was = self.dpms.get(d["name"])
         self.dpms[d["name"]] = now
-        if was is None or was == now or self.streaming:
+        if was is None or was == now or self.streaming or self.test_mode:
             return
         if not now:
             self.event("SYSTEM_DISPLAYS_OFF")
@@ -464,6 +478,40 @@ class Daemon:
             self.event("SYSTEM_DISPLAYS_ON")
             self.user_idle = False
             self.each("on", [d])
+
+    # ------------------------------------------------------------ test mode
+    def poll_test_mode(self):
+        """Every few seconds: follow the test_mode_flags files; while on, keep the panel blank."""
+        want = testmode.active(self.cfg["test_mode_flags"])
+        if want and not self.test_mode:
+            self.test_mode = True
+            self.log("test mode on: TV kept blank, input and idle/display power-off ignored")
+            self.stop_input_watch()
+            self.test_blank_at = {}
+            self.reblank()
+        elif not want and self.test_mode:
+            self.test_mode = False
+            self.log("test mode off: restoring normal behaviour")
+            self.user_idle = False
+            self.test_blank_at = {}
+            self.each("unblank", [d for d in self.managed() if self.topo_ok(d)])
+        elif want:
+            self.reblank()
+        return True
+
+    def reblank(self):
+        """Blank every managed TV that is showing a picture again (known from the persistent
+        connection; without one, retry now and then)."""
+        now = time.time()
+        for d in self.managed():
+            p = self.persist.get(d["name"])
+            if p is not None and p.alive():
+                due = p.state == "Active"
+            else:
+                due = now - self.test_blank_at.get(d["name"], 0) > 30
+            if due and now - self.test_blank_at.get(d["name"], 0) > 5:
+                self.test_blank_at[d["name"]] = now
+                self.each("blank", [d])
 
     # ------------------------------------------------------------ streaming host
     def streaming_change(self, connected):
@@ -575,6 +623,7 @@ class Daemon:
                 elif line == "status":
                     res = {"user_idle": self.user_idle, "streaming": self.streaming, "tray": self.tray.registered,
                            "keep_screen_on": self.keep.active, "network_woken": self.network_woken,
+                           "test_mode": self.test_mode,
                            "idle_backend": self.idle_backend.name if self.idle_backend else None,
                            "managed": [d["name"] for d in self.managed()], "topology": self.topo}
                 else:
@@ -618,6 +667,7 @@ class Daemon:
         self.power_on_at_start()
         self.sync_persistent()
         GLib.timeout_add_seconds(2, self.poll_topology)
+        GLib.timeout_add_seconds(3, self.poll_test_mode)
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGHUP, self.reload)
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: loop.quit() or False)
         loop.run()

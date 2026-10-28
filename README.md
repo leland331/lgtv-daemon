@@ -139,6 +139,29 @@ used in the last two minutes.
 the daemon leaves it off (display, lock-screen and idle events included) until your next keyboard
 or mouse input, then turns it back on. This needs the persistent connection.
 
+## Test mode
+
+For running tests on the PC without the TV lighting up the room or switching itself around, list
+one or more flag files in `~/.config/lgtv-daemon/config.json`:
+
+```json
+{"test_mode_flags": ["/run/user/1000/my-test.flag", "/tmp/another.flag"]}
+```
+
+Test mode is on while any listed file exists. If the file's content is a number it is taken as a
+process ID, and the flag only counts while that process is alive (a leftover file from a crashed
+test is ignored). Anything else in the file, or an empty file, just means "on". The files are
+checked every 3 seconds. While test mode is on the daemon:
+
+- blanks the panel (the same screen-off command as `blank_instead_of_poweroff`) and blanks it
+  again if the TV comes back, but never powers the TV off or on;
+- ignores keyboard and mouse input as a wake signal;
+- skips idle power-off and the power-off that follows the desktop turning its displays off.
+
+When the flag goes away the screen is switched back on and normal behaviour resumes, with no power
+cycle. Transitions are logged (`test mode on` / `test mode off`). The default is an empty list
+(feature off). Commands you send yourself (tray, command line, API) still work.
+
 ## Development
 
 The code is in `lgtvc/`. Run the tests with `python3 -m unittest discover -s tests`, and
