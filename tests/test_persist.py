@@ -104,6 +104,11 @@ class PersistentTest(unittest.TestCase):
         self.assertTrue(p.power_off_now(log=lambda m: None))
         self.assertEqual(sent_json(p.tv.ws)[-1]["uri"], "ssap://system/turnOff")
 
+    def test_power_off_now_from_blank(self):
+        p = self.make("Screen Off")       # blanked (display off): sleep still powers it off for real
+        self.assertTrue(p.power_off_now(log=lambda m: None))
+        self.assertEqual(sent_json(p.tv.ws)[-1]["uri"], "ssap://system/turnOff")
+
     def test_power_off_now_blank(self):
         p = self.make("Active")
         p.power_off_now(blank=True, log=lambda m: None)
