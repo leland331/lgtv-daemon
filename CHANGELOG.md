@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- New option "Blank before power off" (`display_off_blank_minutes`, default 0 = as before). When
+  the desktop turns the display off, the TV picture is blanked and the TV is powered off only if
+  the display is still off that many minutes later.
 - New test mode (`test_mode_flags`, a list of file paths, empty by default). While any listed file
   exists (and, if it holds a PID, that process is alive) the TV is kept blank but powered, input is
   not a wake signal, and idle and display-off power-offs are skipped. When the flag goes away the
