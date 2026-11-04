@@ -135,6 +135,12 @@ sleep, however many times it is asked.
 on. The daemon powers the TV on at start only at boot or login, or if the keyboard or mouse was
 used in the last two minutes.
 
+**Display off.** When the desktop turns the TV's display off (its own screen-off timer), the
+daemon powers the TV off. With "Blank before power off" (`display_off_blank_minutes`, default 0)
+set to N, it blanks the TV picture instead (the TV stays on, so it comes back instantly) and powers
+it off only if the display is still off N minutes later. Input that turns the display back on
+unblanks it. Sleep and shutdown still power the TV off at once.
+
 **Turned off at the TV.** If you switch the TV off with its remote or button while the PC is on,
 the daemon leaves it off (display, lock-screen and idle events included) until your next keyboard
 or mouse input, then turns it back on. This needs the persistent connection.

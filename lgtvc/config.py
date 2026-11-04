@@ -34,6 +34,7 @@ DEFAULTS = {
     "tray": True,                 # show the tray icon
     "power_on_timeout": 40,
     "blank_instead_of_poweroff": False,
+    "display_off_blank_minutes": 0,    # desktop turned the display off: blank, power off after N min (0 = at once)
     "stay_off_on_network_wake": True,  # after a Wake-on-LAN wake the TV stays off until keyboard/mouse input
     "test_mode_flags": [],             # files that switch test mode on while they exist (see README)
     "persistent_connection": True,     # keep a connection open to each TV (fast power off at sleep)
@@ -68,6 +69,10 @@ def normalize(data):
     if isinstance(flags, str):
         flags = [flags]
     cfg["test_mode_flags"] = [str(f) for f in flags if isinstance(f, str) and f] if isinstance(flags, list) else []
+    try:
+        cfg["display_off_blank_minutes"] = max(0, int(cfg["display_off_blank_minutes"]))
+    except (TypeError, ValueError):
+        cfg["display_off_blank_minutes"] = 0
     devs = []
     for i, d in enumerate(cfg["devices"]):
         dev = _merge(DEVICE_DEFAULTS, d)

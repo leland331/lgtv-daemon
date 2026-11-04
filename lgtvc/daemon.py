@@ -43,6 +43,7 @@ class Daemon:
         self.resumed_at = 0.0
         self.topo = {}
         self.dpms = {}
+        self.dpms_blank_at = {}       # device name -> when a display-off blanked it (powers off later)
         self.idle_backend = None
         self.clients = []
         self.clients_lock = threading.Lock()
@@ -286,6 +287,7 @@ class Daemon:
         self.user_idle = False
         self.sleep_off_at = 0.0
         self.resumed_at = time.time()
+        self.dpms_blank_at.clear()        # sleep already powered the TVs off
         self.user_off.clear()             # a new wake starts fresh
         for p in self.persist.values():
             p.kick()                      # the old sockets died with the network during sleep
@@ -460,19 +462,37 @@ class Daemon:
 
     def poll_dpms(self, d, c):
         """The desktop turned the TV's output off/on (its own screen-off timer): follow it, like the
-        original's display off/on events. Unforced, so the HDMI-input check applies."""
+        original's display off/on events. Unforced, so the HDMI-input check applies.
+        With display_off_blank_minutes, display off first blanks the TV and powers it off only
+        once the display has stayed off that long."""
         if not topology.active(c):
             self.dpms.pop(d["name"], None)
+            self.dpms_blank_at.pop(d["name"], None)
             return
         now = topology.display_on(c)
         was = self.dpms.get(d["name"])
         self.dpms[d["name"]] = now
-        if was is None or was == now or self.streaming or self.test_mode:
+        if was is None or self.streaming or self.test_mode:
+            return
+        if was == now:
+            t = self.dpms_blank_at.get(d["name"])
+            if not now and t is not None and time.time() - t >= self.cfg["display_off_blank_minutes"] * 60:
+                del self.dpms_blank_at[d["name"]]
+                self.log("%s: display still off, powering the TV off" % d["name"])
+                self.each("off", [d])
             return
         if not now:
             self.event("SYSTEM_DISPLAYS_OFF")
-            self.each("off", [d])
-        elif self.network_woken:
+            mins = self.cfg["display_off_blank_minutes"]
+            if mins > 0:
+                self.dpms_blank_at[d["name"]] = time.time()
+                self.log("%s: display off, blanking; power off in %d min if it stays off" % (d["name"], mins))
+                self.each("blank", [d])
+            else:
+                self.each("off", [d])
+            return
+        self.dpms_blank_at.pop(d["name"], None)
+        if self.network_woken:
             self.log("%s: display on after a network wake, TV stays off until input" % d["name"])
         else:
             self.event("SYSTEM_DISPLAYS_ON")

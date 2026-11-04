@@ -64,7 +64,7 @@ class DaemonTest(unittest.TestCase):
         d.user_off, d.on_busy, d.own_off_at = set(), set(), {}
         d.sleep_off_at = d.resumed_at = 0.0
         d.network_woken = d.user_idle = d.streaming = d.test_mode = False
-        d.test_blank_at, d.persist, d.dpms = {}, {}, {}
+        d.test_blank_at, d.persist, d.dpms, d.dpms_blank_at = {}, {}, {}, {}
         d.pool = FakePool()
         d.logs = []
         d.log = d.logs.append
@@ -145,6 +145,49 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual(len(d.pool.calls), 1)
         self.assertIs(d.pool.calls[0][1], daemon.webos.screen_on)   # un-blank, not a power on
         self.assertTrue(any("test mode off" in m for m in d.logs))
+
+
+@unittest.skipIf(daemon is None, "needs PyGObject")
+class DisplayOffBlankTest(unittest.TestCase):
+    def dpms(self, d, on, at=1000.0):
+        with mock.patch.object(daemon.topology, "active", return_value=True), \
+                mock.patch.object(daemon.topology, "display_on", return_value=on), \
+                mock.patch.object(daemon.time, "time", return_value=at):
+            d.poll_dpms(DEV, {})
+
+    def make(self):
+        d = DaemonTest.make(self)
+        d.cfg["display_off_blank_minutes"] = 20
+        d.dpms["LG"] = True
+        return d
+
+    def test_blank_then_off(self):
+        d = self.make()
+        self.dpms(d, False)
+        self.assertEqual(d.pool.calls[-1][1:3], (daemon.webos.power_off, DEV))
+        self.assertIs(d.pool.calls[-1][3], True)                 # blank, not power off
+        self.dpms(d, False, 1000 + 19 * 60)
+        self.assertEqual(len(d.pool.calls), 1)
+        self.dpms(d, False, 1000 + 20 * 60)
+        self.assertEqual(len(d.pool.calls), 2)
+        self.assertIs(d.pool.calls[-1][3], False)                # now a real power off
+        self.dpms(d, False, 1000 + 40 * 60)
+        self.assertEqual(len(d.pool.calls), 2)                   # only once
+
+    def test_display_on_cancels(self):
+        d = self.make()
+        self.dpms(d, False)
+        self.dpms(d, True, 1000 + 60)
+        self.assertEqual(d.pool.calls[-1][1], d._power_on)         # power on also unblanks
+        self.dpms(d, True, 1000 + 30 * 60)
+        self.assertEqual(len(d.pool.calls), 2)
+        self.assertEqual(d.dpms_blank_at, {})
+
+    def test_zero_keeps_old_behaviour(self):
+        d = self.make()
+        d.cfg["display_off_blank_minutes"] = 0
+        self.dpms(d, False)
+        self.assertIs(d.pool.calls[-1][3], False)
 
 
 if __name__ == "__main__":
