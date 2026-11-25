@@ -2,7 +2,6 @@
 
 - Goal: Add a generic 'test mode' to lgtv-daemon (public repo: keep it general, no homelab paths or names in code, docs or defaults).
 - Project: lgtv-daemon, branch `thread/20261028-add-a-generic-test-mode`
-- Machine: tower
 - Agent: claude:sonnet
 - Started: 2026-10-28 00:01 CST (by `lab thread`)
 - Status: done (draft PR open)
