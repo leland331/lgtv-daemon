@@ -10,7 +10,7 @@ try:
 except ImportError:          # needs PyGObject
     daemon = None
 
-DEV = config.normalize({"devices": [{"name": "LG", "ip": "192.168.50.2", "key": "k"}]})["devices"][0]
+DEV = config.normalize({"devices": [{"name": "LG", "ip": "192.0.2.10", "key": "k"}]})["devices"][0]
 
 
 class FlagTest(unittest.TestCase):

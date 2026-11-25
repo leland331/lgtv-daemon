@@ -66,7 +66,7 @@ class FakeTV:
         pass
 
 
-DEV = config.normalize({"devices": [{"name": "LG", "ip": "192.168.50.2", "key": "k"}]})["devices"][0]
+DEV = config.normalize({"devices": [{"name": "LG", "ip": "192.0.2.10", "key": "k"}]})["devices"][0]
 
 
 class WebSocketTimeoutTest(unittest.TestCase):
